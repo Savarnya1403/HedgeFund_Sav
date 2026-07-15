@@ -1,0 +1,150 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-bg: #000000;
+  --color-surface: #0a0a0a;
+  --color-card: #111111;
+  --color-border: #1a1a1a;
+  --color-border-light: #222222;
+  --color-muted: #444444;
+  --color-dim: #2a2a2a;
+  --color-gain: #00d084;
+  --color-loss: #ff3b3b;
+  --color-amber: #f59e0b;
+  --color-blue: #3b82f6;
+  --color-purple: #8b5cf6;
+  --font-sans: var(--font-geist-sans), system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), "Roboto Mono", monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; padding: 0; }
+
+body {
+  background: #000;
+  color: #c8c8c8;
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+  font-size: 12px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: #000; }
+::-webkit-scrollbar-thumb { background: #222; border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: #333; }
+
+/* Numbers — monospaced tabular */
+.num {
+  font-family: var(--font-geist-mono), "Roboto Mono", monospace;
+  font-variant-numeric: tabular-nums lining-nums;
+  letter-spacing: -0.01em;
+}
+
+/* Gain / Loss */
+.gain   { color: #00d084; }
+.loss   { color: #ff3b3b; }
+.neutral { color: #555; }
+
+/* Price flash animations */
+@keyframes flash-up {
+  0%   { background: rgba(0, 208, 132, 0.25); color: #00d084; }
+  60%  { background: rgba(0, 208, 132, 0.10); }
+  100% { background: transparent; }
+}
+@keyframes flash-down {
+  0%   { background: rgba(255, 59, 59, 0.25); color: #ff3b3b; }
+  60%  { background: rgba(255, 59, 59, 0.10); }
+  100% { background: transparent; }
+}
+@keyframes flash-neutral {
+  0%   { background: rgba(255,255,255,0.06); }
+  100% { background: transparent; }
+}
+
+.price-flash-up   { animation: flash-up   0.9s ease-out forwards; }
+.price-flash-down { animation: flash-down 0.9s ease-out forwards; }
+.price-flash-neu  { animation: flash-neutral 0.5s ease-out forwards; }
+
+/* Pulse dot */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.4; transform: scale(0.75); }
+}
+.live-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: #00d084;
+  box-shadow: 0 0 5px #00d084;
+  animation: pulse-dot 2s ease-in-out infinite;
+  flex-shrink: 0;
+}
+.live-dot.closed { background: #ff3b3b; box-shadow: 0 0 5px #ff3b3b; animation: none; }
+
+/* Skeleton shimmer */
+.skeleton {
+  background: linear-gradient(90deg, #111 25%, #1a1a1a 50%, #111 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite;
+  border-radius: 3px;
+}
+@keyframes shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Badge variants */
+.badge {
+  display: inline-flex; align-items: center;
+  padding: 1px 6px; border-radius: 3px;
+  font-size: 10px; font-weight: 600; letter-spacing: 0.03em;
+}
+.badge-gain    { background: rgba(0,208,132,0.12);  color: #00d084; border: 1px solid rgba(0,208,132,0.2); }
+.badge-loss    { background: rgba(255,59,59,0.12);   color: #ff3b3b; border: 1px solid rgba(255,59,59,0.2); }
+.badge-neutral { background: rgba(85,85,85,0.15);    color: #888;   border: 1px solid #222; }
+.badge-amber   { background: rgba(245,158,11,0.12);  color: #f59e0b; border: 1px solid rgba(245,158,11,0.2); }
+.badge-blue    { background: rgba(59,130,246,0.12);  color: #3b82f6; border: 1px solid rgba(59,130,246,0.2); }
+
+/* Terminal card */
+.t-card {
+  background: #0a0a0a;
+  border: 1px solid #1a1a1a;
+  border-radius: 4px;
+}
+
+/* Toast slide-in */
+@keyframes toast-in {
+  from { transform: translateX(110%); opacity: 0; }
+  to   { transform: translateX(0);    opacity: 1; }
+}
+@keyframes toast-out {
+  from { transform: translateX(0);    opacity: 1; }
+  to   { transform: translateX(110%); opacity: 0; }
+}
+.toast-enter { animation: toast-in  0.3s cubic-bezier(0.16,1,0.3,1) forwards; }
+.toast-exit  { animation: toast-out 0.2s ease-in forwards; }
+
+/* Command palette backdrop */
+@keyframes cmd-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.cmd-backdrop { animation: cmd-in 0.15s ease-out; }
+
+/* Tab underline active */
+.tab-active { border-bottom: 2px solid #3b82f6; color: #e5e5e5 !important; }
+
+/* News sentiment dots */
+.sent-pos { color: #00d084; }
+.sent-neg { color: #ff3b3b; }
+.sent-neu { color: #555; }
+
+/* Ticker tape smooth scroll */
+@keyframes ticker {
+  0%   { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+.ticker-inner { animation: ticker 60s linear infinite; display: flex; }
+.ticker-inner:hover { animation-play-state: paused; }
