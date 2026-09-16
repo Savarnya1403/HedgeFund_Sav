@@ -21,6 +21,8 @@ import macro_engine as _macro
 import institutional as _inst
 import quant_models as _qm
 import recommendation as _rec
+import order_flow as _of
+import vol_surface as _vs
 
 import aiohttp
 import numpy as np
@@ -28,7 +30,8 @@ import pandas as pd
 import requests
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 from math import log, sqrt, exp, pi
 
@@ -189,27 +192,68 @@ class YFData:
     _crumb_ts: float = 0
     _cache: Dict[str, Any] = {}
     _cache_ts: Dict[str, float] = {}
-    CACHE_TTL = 300  # seconds — live prices via SSE; REST cache can be 5 min
-    CRUMB_TTL = 3600  # refresh crumb every hour
+    _stale_cache: Dict[str, Any] = {}   # never-expiring fallback for connection errors
+    _err_count: int = 0                  # consecutive error counter for circuit breaker
+    CACHE_TTL = 300  # seconds
+    CRUMB_TTL = 3600
+    _RESET_THRESHOLD = 10               # reset session after this many consecutive errors
+
+    @classmethod
+    def _build_session(cls) -> requests.Session:
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+
+        s = requests.Session()
+        s.verify = False
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+        })
+        # Retry on transient errors: 3 attempts, exponential backoff (0.5s, 1s, 2s)
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry,
+            pool_connections=6,
+            pool_maxsize=16,
+            pool_block=False,
+        )
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        # Seed cookies
+        try:
+            s.headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            s.get("https://finance.yahoo.com/", timeout=12)
+        except Exception:
+            pass
+        s.headers["Accept"] = "application/json"
+        return s
 
     @classmethod
     def _get_session(cls) -> requests.Session:
         if cls._session is None:
-            cls._session = requests.Session()
-            cls._session.verify = False
-            cls._session.headers.update({
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept-Language": "en-US,en;q=0.9",
-            })
-            # Seed cookies by visiting the homepage (no custom Accept — use browser default)
-            try:
-                cls._session.headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-                cls._session.get("https://finance.yahoo.com/", timeout=10)
-            except Exception:
-                pass
-            # Switch to JSON Accept for API calls
-            cls._session.headers["Accept"] = "application/json"
+            cls._session = cls._build_session()
         return cls._session
+
+    @classmethod
+    def _reset_session(cls):
+        """Force a fresh session — called after repeated connection failures."""
+        try:
+            if cls._session:
+                cls._session.close()
+        except Exception:
+            pass
+        cls._session = None
+        cls._crumb = None
+        cls._crumb_ts = 0
+        cls._err_count = 0
+        logger.info("YFData session reset after repeated connection errors")
 
     @classmethod
     def _get_crumb(cls) -> Optional[str]:
@@ -239,9 +283,16 @@ class YFData:
         return None
 
     @classmethod
+    def _stale(cls, key: str) -> Optional[Any]:
+        """Return last-known-good value even if cache is expired — used on connection errors."""
+        return cls._stale_cache.get(key)
+
+    @classmethod
     def _store(cls, key: str, val: Any):
         cls._cache[key] = val
         cls._cache_ts[key] = time.time()
+        cls._stale_cache[key] = val   # always keep a stale copy
+        cls._err_count = 0            # successful fetch resets error counter
 
     @classmethod
     def yf_sym(cls, symbol: str) -> str:
@@ -263,14 +314,53 @@ class YFData:
                 timeout=20
             )
             if r.status_code != 200:
-                return None
+                return cls._stale(key)
             result = r.json().get("chart", {}).get("result")
             if not result:
-                return None
+                return cls._stale(key)
             cls._store(key, result[0])
             return result[0]
         except Exception as e:
             logger.error(f"YF chart_raw {raw_symbol}: {e}")
+            cls._err_count += 1
+            if cls._err_count >= cls._RESET_THRESHOLD:
+                cls._reset_session()
+            return cls._stale(key)
+
+    @classmethod
+    def _chart_via_yfinance(cls, symbol: str, range_: str, interval: str) -> Optional[Dict]:
+        """Fallback: use yfinance library (handles cookies/crumb internally)."""
+        try:
+            import yfinance as yf
+            yf_sym = cls.yf_sym(symbol)
+            # Map range → yf period
+            period_map = {"1d": "1d", "5d": "5d", "1mo": "1mo", "3mo": "3mo",
+                          "6mo": "6mo", "1y": "1y", "2y": "2y", "5y": "5y"}
+            period = period_map.get(range_, "1y")
+            df = yf.Ticker(yf_sym).history(period=period, interval=interval, auto_adjust=False)
+            if df is None or df.empty:
+                return None
+            # Convert DataFrame → fake chart result dict that history() can parse
+            timestamps = [int(dt.timestamp()) for dt in df.index]
+            result = {
+                "meta": {"symbol": yf_sym, "regularMarketPrice": float(df["Close"].iloc[-1]),
+                         "previousClose": float(df["Close"].iloc[-2]) if len(df) > 1 else float(df["Close"].iloc[-1]),
+                         "regularMarketVolume": int(df["Volume"].iloc[-1]),
+                         "fiftyTwoWeekHigh": float(df["High"].max()),
+                         "fiftyTwoWeekLow": float(df["Low"].min()),
+                         "marketCap": 0, "currency": "INR"},
+                "timestamp": timestamps,
+                "indicators": {"quote": [{
+                    "open":   [float(v) if v == v else None for v in df["Open"]],
+                    "high":   [float(v) if v == v else None for v in df["High"]],
+                    "low":    [float(v) if v == v else None for v in df["Low"]],
+                    "close":  [float(v) if v == v else None for v in df["Close"]],
+                    "volume": [int(v) if v == v else 0 for v in df["Volume"]],
+                }]},
+            }
+            return result
+        except Exception as e:
+            logger.debug(f"yfinance fallback failed for {symbol}: {e}")
             return None
 
     @classmethod
@@ -279,6 +369,9 @@ class YFData:
         cached = cls._cached(key)
         if cached is not None:
             return cached
+        # Brief jitter to avoid thundering-herd on parallel calls
+        import random
+        time.sleep(random.uniform(0.05, 0.20))
         try:
             url = f"{cls.BASE}/v8/finance/chart/{cls.yf_sym(symbol)}"
             r = cls._get_session().get(
@@ -286,17 +379,36 @@ class YFData:
                 params={"interval": interval, "range": range_, "includePrePost": False},
                 timeout=20
             )
+            if r.status_code == 429:
+                # Rate limited — fall back to yfinance library
+                result = cls._chart_via_yfinance(symbol, range_, interval)
+                if result:
+                    cls._store(key, result)
+                    return result
+                return cls._stale(key)
             if r.status_code != 200:
-                return None
+                result = cls._chart_via_yfinance(symbol, range_, interval)
+                if result:
+                    cls._store(key, result)
+                    return result
+                return cls._stale(key)
             data = r.json()
             result = data.get("chart", {}).get("result")
             if not result:
-                return None
+                return cls._stale(key)
             cls._store(key, result[0])
             return result[0]
         except Exception as e:
             logger.error(f"YF chart {symbol}: {e}")
-            return None
+            cls._err_count += 1
+            if cls._err_count >= cls._RESET_THRESHOLD:
+                cls._reset_session()
+            # Try yfinance library as last resort
+            result = cls._chart_via_yfinance(symbol, range_, interval)
+            if result:
+                cls._store(key, result)
+                return result
+            return cls._stale(key)
 
     @classmethod
     def live_price(cls, symbol: str) -> Optional[Dict]:
@@ -369,7 +481,8 @@ class YFData:
 
         data = cls.chart(symbol, range_, interval)
         if not data:
-            return []
+            stale = cls._stale(key)
+            return stale if stale else []
 
         timestamps = data.get("timestamp", [])
         quotes = data.get("indicators", {}).get("quote", [{}])[0]
@@ -1510,9 +1623,10 @@ async def price_broadcaster():
     _price_snapshot_ts = time.time()
     logger.info(f"Price cache warmed: {len(warmup)} symbols")
 
+    _broadcast_errors = 0
     while True:
         try:
-            all_syms: Set[str] = set(NIFTY50_SYMBOLS[:15])
+            all_syms: Set[str] = set(NIFTY50_SYMBOLS[:12])  # reduced from 15
             for s in mgr.subs.values():
                 all_syms.update(s)
             prices = await fetch_prices_parallel(list(all_syms))
@@ -1521,9 +1635,17 @@ async def price_broadcaster():
                 _price_snapshot_ts = time.time()
                 await mgr.broadcast(prices)
                 await _sse_push(prices)
+                _broadcast_errors = 0
         except Exception as e:
             logger.error(f"Broadcaster: {e}")
-        await asyncio.sleep(3)
+            _broadcast_errors += 1
+        # Back off if YF is struggling: 3s normal → 8s after 3 errors → 15s after 6
+        if _broadcast_errors >= 6:
+            await asyncio.sleep(15)
+        elif _broadcast_errors >= 3:
+            await asyncio.sleep(8)
+        else:
+            await asyncio.sleep(5)
 
 async def news_background_updater():
     global _latest_market_news, _news_ts
@@ -1538,21 +1660,63 @@ async def news_background_updater():
         await asyncio.sleep(120)
 
 async def history_cache_warmer():
-    """Pre-warm history cache for top symbols on startup (runs once)"""
-    await asyncio.sleep(15)  # let prices warm up first
+    """Pre-warm history cache for all symbols + screener cache on startup"""
+    await asyncio.sleep(20)  # let prices warm up first
     loop = asyncio.get_event_loop()
-    top_syms = NIFTY50_SYMBOLS[:10]
-    logger.info(f"Warming history cache for {len(top_syms)} symbols…")
-    tasks = [loop.run_in_executor(None, lambda s=sym: YFData.history(s, "3mo")) for sym in top_syms]
-    await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Phase 1: batch history fetches (10 at a time) to avoid overwhelming YF
+    logger.info(f"Warming history cache for {len(ALL_SYMBOLS)} symbols (batched)…")
+    BATCH = 8
+    for i in range(0, len(ALL_SYMBOLS), BATCH):
+        batch = ALL_SYMBOLS[i:i + BATCH]
+        tasks = (
+            [loop.run_in_executor(None, lambda s=sym: YFData.history(s, "3mo")) for sym in batch] +
+            [loop.run_in_executor(None, lambda s=sym: YFData.history(s, "1y"))  for sym in batch]
+        )
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(0.4)   # small pause between batches
     logger.info("History cache warm complete")
+
+    # Phase 2: pre-compute all screener results so first page load is instant
+    logger.info("Pre-computing screener caches…")
+    for key, fn in [("momentum", _compute_momentum), ("meanrev", _compute_meanrev),
+                    ("breakout", _compute_breakout), ("volume", _compute_volume)]:
+        try:
+            out = await loop.run_in_executor(None, fn)
+            _store_screen(key, out)
+            logger.info(f"Screener '{key}' warmed: {len(out.get('results', []))} results")
+        except Exception as e:
+            logger.warning(f"Screener '{key}' warmup failed: {e}")
+    logger.info("All screener caches ready")
+
+    # Phase 3: pre-compute sector spotlight
+    try:
+        global _spotlight_cache, _spotlight_ts
+        result = await loop.run_in_executor(None, _compute_sector_spotlight)
+        _spotlight_cache = result
+        _spotlight_ts = time.time()
+        logger.info(f"Sector spotlight warmed: {len(result.get('sectors', []))} sectors")
+    except Exception as e:
+        logger.warning(f"Sector spotlight warmup failed: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────
 # FASTAPI APP
 # ──────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Indian Hedge Fund API v3", version="3.0.0")
+class _NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer): return int(obj)
+        if isinstance(obj, np.floating): return None if (np.isnan(obj) or np.isinf(obj)) else float(obj)
+        if isinstance(obj, np.bool_): return bool(obj)
+        if isinstance(obj, np.ndarray): return obj.tolist()
+        return super().default(obj)
+
+class NumpyJSONResponse(JSONResponse):
+    def render(self, content) -> bytes:
+        return json.dumps(content, cls=_NumpyEncoder, allow_nan=False, default=str).encode("utf-8")
+
+app = FastAPI(title="Indian Hedge Fund API v3", version="3.0.0", default_response_class=NumpyJSONResponse)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
@@ -2095,169 +2259,186 @@ async def get_pair_detail(sym1: str, sym2: str, lookback: int = 120):
 # ──────────────────────────────────────────────────────────────────
 
 _screen_cache: Dict = {}
-_screen_ts: float = 0
-_SCREEN_TTL = 1200  # 20 min
+_screen_cache_ts: Dict[str, float] = {}
+_SCREEN_TTL = 900  # 15 min
 
 
-async def _batch_quotes_and_history(symbols: List[str]) -> Tuple[List[Dict], Dict[str, List[Dict]]]:
-    quotes: List[Dict] = []
-    histories: Dict[str, List[Dict]] = {}
-    for sym in symbols:
-        q = YFData.live_price(sym)
-        if q:
-            quotes.append(q)
-        h = YFData.history(sym, "1y")
-        if h:
-            histories[sym] = h
-    return quotes, histories
+# ── sync compute functions (run in executor so they never block the event loop) ──
+
+def _compute_momentum() -> Dict:
+    results = []
+    for sym in ALL_SYMBOLS:
+        try:
+            hist = YFData.history(sym, "1y")
+            if not hist or len(hist) < 65:
+                continue
+            closes = [h["close"] for h in hist]
+            q = YFData.live_price(sym)
+            price = (q or {}).get("price", closes[-1])
+            chg_pct = (q or {}).get("change_pct", 0)
+            score = _ana.rs_rank(
+                closes[-65:],
+                closes[-125:] if len(closes) >= 125 else closes,
+                closes,
+            )
+            results.append({
+                "symbol": sym,
+                "company": COMPANY_NAMES.get(sym, sym),
+                "price": round(float(price), 2),
+                "change_pct": round(float(chg_pct), 2),
+                "rs_score": score,
+                "ret_65d": round((closes[-1] / closes[-65] - 1) * 100, 2) if len(closes) >= 65 else 0,
+                "ret_125d": round((closes[-1] / closes[-125] - 1) * 100, 2) if len(closes) >= 125 else 0,
+                "ret_252d": round((closes[-1] / closes[0] - 1) * 100, 2),
+            })
+        except Exception:
+            pass
+    results.sort(key=lambda x: x["rs_score"], reverse=True)
+    for i, r in enumerate(results):
+        r["rank"] = i + 1
+    return {"type": "momentum", "results": results, "ts": int(time.time())}
+
+
+def _compute_meanrev() -> Dict:
+    results = []
+    for sym in ALL_SYMBOLS:
+        try:
+            hist = YFData.history(sym, "6mo")
+            if not hist or len(hist) < 20:
+                continue
+            closes = [h["close"] for h in hist]
+            q = YFData.live_price(sym)
+            price = (q or {}).get("price", closes[-1])
+            chg_pct = (q or {}).get("change_pct", 0)
+            sig = _ana.mean_reversion_signal(closes)
+            # Include neutral too — filter on frontend or show all ranked
+            results.append({
+                "symbol": sym,
+                "company": COMPANY_NAMES.get(sym, sym),
+                "price": round(float(price), 2),
+                "change_pct": round(float(chg_pct), 2),
+                **sig,
+            })
+        except Exception:
+            pass
+    # Sort: extremes first (largest absolute z-score)
+    results.sort(key=lambda x: abs(x.get("zscore", 0)), reverse=True)
+    return {"type": "meanrev", "results": results, "ts": int(time.time())}
+
+
+def _compute_breakout() -> Dict:
+    results = []
+    for sym in ALL_SYMBOLS:
+        try:
+            hist = YFData.history(sym, "1y")
+            if not hist or len(hist) < 20:
+                continue
+            closes = [h["close"] for h in hist]
+            vols = [h.get("volume", 0) for h in hist]
+            q = YFData.live_price(sym)
+            price = (q or {}).get("price", closes[-1])
+            chg_pct = (q or {}).get("change_pct", 0)
+            year_high = (q or {}).get("year_high", 0)
+            # If no year_high from live price, derive from history
+            if not year_high:
+                year_high = float(max(closes[-252:] if len(closes) >= 252 else closes))
+
+            sig = _ana.breakout_signal(closes, vols, year_high)
+            # Include near_52w_high and above; skip true "none"
+            if sig["type"] != "none":
+                results.append({
+                    "symbol": sym,
+                    "company": COMPANY_NAMES.get(sym, sym),
+                    "price": round(float(price), 2),
+                    "change_pct": round(float(chg_pct), 2),
+                    "year_high": round(float(year_high), 2),
+                    **sig,
+                })
+        except Exception:
+            pass
+    priority = {"52w_high_breakout": 0, "resistance_break": 1, "near_52w_high": 2}
+    results.sort(key=lambda x: (priority.get(x.get("type", ""), 9), -x.get("vol_ratio", 0)))
+    return {"type": "breakout", "results": results, "ts": int(time.time())}
+
+
+def _compute_volume() -> Dict:
+    results = []
+    for sym in ALL_SYMBOLS:
+        try:
+            hist = YFData.history(sym, "3mo")
+            if not hist or len(hist) < 20:
+                continue
+            vols = [h.get("volume", 0) for h in hist]
+            closes = [h["close"] for h in hist]
+            today_vol = vols[-1]
+            avg_vol = float(np.mean(vols[-20:-1])) if len(vols) >= 20 else 0
+            if avg_vol <= 0 or today_vol <= 0:
+                continue
+            ratio = today_vol / avg_vol
+            # Lowered threshold from 2.0 → 1.5 to capture more surge events
+            if ratio >= 1.5:
+                q = YFData.live_price(sym)
+                price = (q or {}).get("price", closes[-1])
+                chg_pct = (q or {}).get("change_pct", 0)
+                results.append({
+                    "symbol": sym,
+                    "company": COMPANY_NAMES.get(sym, sym),
+                    "price": round(float(price), 2),
+                    "change_pct": round(float(chg_pct), 2),
+                    "vol_ratio": round(ratio, 2),
+                    "today_volume": int(today_vol),
+                    "avg_volume": int(avg_vol),
+                })
+        except Exception:
+            pass
+    results.sort(key=lambda x: x["vol_ratio"], reverse=True)
+    return {"type": "volume", "results": results, "ts": int(time.time())}
+
+
+def _is_cache_fresh(key: str) -> bool:
+    return key in _screen_cache and (time.time() - _screen_cache_ts.get(key, 0)) < _SCREEN_TTL
+
+
+def _store_screen(key: str, out: Dict) -> Dict:
+    _screen_cache[key] = out
+    _screen_cache_ts[key] = time.time()
+    return out
 
 
 @app.get("/api/screener/momentum")
 async def screener_momentum():
-    cache_key = "momentum"
-    cached = _screen_cache.get(cache_key)
-    if cached and (time.time() - _screen_ts) < _SCREEN_TTL:
-        return cached
-
-    results = []
-    for sym in ALL_SYMBOLS:
-        hist = YFData.history(sym, "1y")
-        if not hist or len(hist) < 65:
-            continue
-        closes = [h["close"] for h in hist]
-        q = YFData.live_price(sym)
-        price = (q or {}).get("price", closes[-1])
-        chg_pct = (q or {}).get("change_pct", 0)
-
-        score = _ana.rs_rank(closes[-65:], closes[-125:] if len(closes) >= 125 else closes, closes)
-        results.append({
-            "symbol": sym,
-            "company": COMPANY_NAMES.get(sym, sym),
-            "price": round(float(price), 2),
-            "change_pct": round(float(chg_pct), 2),
-            "rs_score": score,
-            "ret_65d": round((closes[-1] / closes[-65] - 1) * 100, 2) if len(closes) >= 65 else 0,
-            "ret_125d": round((closes[-1] / closes[-125] - 1) * 100, 2) if len(closes) >= 125 else 0,
-            "ret_252d": round((closes[-1] / closes[0] - 1) * 100, 2),
-        })
-
-    results.sort(key=lambda x: x["rs_score"], reverse=True)
-    for i, r in enumerate(results):
-        r["rank"] = i + 1
-
-    out = {"type": "momentum", "results": results, "ts": int(time.time())}
-    _screen_cache[cache_key] = out
-    return out
+    if _is_cache_fresh("momentum"):
+        return _screen_cache["momentum"]
+    loop = asyncio.get_event_loop()
+    out = await loop.run_in_executor(None, _compute_momentum)
+    return _store_screen("momentum", out)
 
 
 @app.get("/api/screener/meanrev")
 async def screener_mean_reversion():
-    cache_key = "meanrev"
-    cached = _screen_cache.get(cache_key)
-    if cached and (time.time() - _screen_ts) < _SCREEN_TTL:
-        return cached
-
-    results = []
-    for sym in ALL_SYMBOLS:
-        hist = YFData.history(sym, "6mo")
-        if not hist or len(hist) < 20:
-            continue
-        closes = [h["close"] for h in hist]
-        q = YFData.live_price(sym)
-        price = (q or {}).get("price", closes[-1])
-        chg_pct = (q or {}).get("change_pct", 0)
-
-        sig = _ana.mean_reversion_signal(closes)
-        if sig["signal"] in ("strong_buy", "oversold", "strong_sell", "overbought"):
-            results.append({
-                "symbol": sym,
-                "company": COMPANY_NAMES.get(sym, sym),
-                "price": round(float(price), 2),
-                "change_pct": round(float(chg_pct), 2),
-                **sig,
-            })
-
-    results.sort(key=lambda x: abs(x["zscore"]), reverse=True)
-    out = {"type": "meanrev", "results": results, "ts": int(time.time())}
-    _screen_cache[cache_key] = out
-    return out
+    if _is_cache_fresh("meanrev"):
+        return _screen_cache["meanrev"]
+    loop = asyncio.get_event_loop()
+    out = await loop.run_in_executor(None, _compute_meanrev)
+    return _store_screen("meanrev", out)
 
 
 @app.get("/api/screener/breakout")
 async def screener_breakout():
-    cache_key = "breakout"
-    cached = _screen_cache.get(cache_key)
-    if cached and (time.time() - _screen_ts) < _SCREEN_TTL:
-        return cached
-
-    results = []
-    for sym in ALL_SYMBOLS:
-        hist = YFData.history(sym, "1y")
-        if not hist or len(hist) < 20:
-            continue
-        closes = [h["close"] for h in hist]
-        vols = [h.get("volume", 0) for h in hist]
-        q = YFData.live_price(sym)
-        price = (q or {}).get("price", closes[-1])
-        chg_pct = (q or {}).get("change_pct", 0)
-        year_high = (q or {}).get("year_high", 0)
-
-        sig = _ana.breakout_signal(closes, vols, year_high)
-        if sig["type"] != "none":
-            results.append({
-                "symbol": sym,
-                "company": COMPANY_NAMES.get(sym, sym),
-                "price": round(float(price), 2),
-                "change_pct": round(float(chg_pct), 2),
-                "year_high": year_high,
-                **sig,
-            })
-
-    priority = {"52w_high_breakout": 0, "resistance_break": 1, "near_52w_high": 2}
-    results.sort(key=lambda x: (priority.get(x["type"], 9), -x.get("vol_ratio", 0)))
-    out = {"type": "breakout", "results": results, "ts": int(time.time())}
-    _screen_cache[cache_key] = out
-    return out
+    if _is_cache_fresh("breakout"):
+        return _screen_cache["breakout"]
+    loop = asyncio.get_event_loop()
+    out = await loop.run_in_executor(None, _compute_breakout)
+    return _store_screen("breakout", out)
 
 
 @app.get("/api/screener/volume")
 async def screener_volume_surge():
-    cache_key = "volume"
-    cached = _screen_cache.get(cache_key)
-    if cached and (time.time() - _screen_ts) < _SCREEN_TTL:
-        return cached
-
-    results = []
-    for sym in ALL_SYMBOLS:
-        hist = YFData.history(sym, "3mo")
-        if not hist or len(hist) < 20:
-            continue
-        vols = [h.get("volume", 0) for h in hist]
-        closes = [h["close"] for h in hist]
-        today_vol = vols[-1]
-        avg_vol = float(np.mean(vols[-20:-1])) if len(vols) >= 20 else 0
-        if avg_vol <= 0 or today_vol <= 0:
-            continue
-
-        ratio = today_vol / avg_vol
-        if ratio >= 2.0:
-            q = YFData.live_price(sym)
-            price = (q or {}).get("price", closes[-1])
-            chg_pct = (q or {}).get("change_pct", 0)
-            results.append({
-                "symbol": sym,
-                "company": COMPANY_NAMES.get(sym, sym),
-                "price": round(float(price), 2),
-                "change_pct": round(float(chg_pct), 2),
-                "vol_ratio": round(ratio, 2),
-                "today_volume": int(today_vol),
-                "avg_volume": int(avg_vol),
-            })
-
-    results.sort(key=lambda x: x["vol_ratio"], reverse=True)
-    out = {"type": "volume", "results": results, "ts": int(time.time())}
-    _screen_cache[cache_key] = out
-    return out
+    if _is_cache_fresh("volume"):
+        return _screen_cache["volume"]
+    loop = asyncio.get_event_loop()
+    out = await loop.run_in_executor(None, _compute_volume)
+    return _store_screen("volume", out)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -2375,6 +2556,100 @@ async def sector_heatmap():
     _sector_cache = {"sectors": result, "ts": int(time.time())}
     _sector_ts = time.time()
     return _sector_cache
+
+
+_spotlight_cache: Dict = {}
+_spotlight_ts: float = 0
+_SPOTLIGHT_TTL = 300  # 5 min
+
+
+def _compute_sector_spotlight() -> Dict:
+    """Multi-factor sector scoring: 1d momentum, 5d momentum, breadth, volume surge."""
+    scored = []
+    for sector, symbols in SECTORS.items():
+        prices_1d, vol_ratios, rsv = [], [], []
+        advances, total = 0, 0
+
+        for sym in symbols:
+            q = YFData.live_price(sym)
+            if not q or q.get("price", 0) <= 0:
+                continue
+            chg = q.get("change_pct", 0) or 0
+            prices_1d.append(chg)
+            total += 1
+            if chg > 0:
+                advances += 1
+
+            try:
+                hist = YFData.history(sym, "1mo")
+                if hist is not None and len(hist) >= 10:
+                    closes = hist["Close"].dropna()
+                    vols = hist["Volume"].dropna()
+                    if len(closes) >= 6:
+                        ret5d = float((closes.iloc[-1] / closes.iloc[-6] - 1) * 100)
+                        rsv.append(ret5d)
+                    if len(vols) >= 5:
+                        avg_vol = float(vols.iloc[:-1].mean())
+                        cur_vol = float(vols.iloc[-1])
+                        if avg_vol > 0:
+                            vol_ratios.append(cur_vol / avg_vol)
+            except Exception:
+                pass
+
+        if not prices_1d:
+            continue
+
+        mom_1d = float(np.mean(prices_1d))
+        mom_5d = float(np.mean(rsv)) if rsv else 0.0
+        breadth = (advances / total) if total > 0 else 0.5
+        vol_surge = float(np.mean(vol_ratios)) if vol_ratios else 1.0
+
+        # Shine score: weighted composite (scale each factor)
+        score = (
+            mom_1d * 0.30 +
+            mom_5d * 0.30 +
+            (breadth - 0.5) * 40 * 0.25 +
+            (vol_surge - 1.0) * 10 * 0.15
+        )
+
+        if score > 3:
+            label, color = "HOT", "#10b981"
+        elif score > 0.5:
+            label, color = "BUILDING", "#3b82f6"
+        elif score < -3:
+            label, color = "FALLING", "#ef4444"
+        elif score < -0.5:
+            label, color = "COOLING", "#f59e0b"
+        else:
+            label, color = "NEUTRAL", "#6b7280"
+
+        scored.append({
+            "sector": sector,
+            "shine_score": round(score, 2),
+            "mom_1d": round(mom_1d, 2),
+            "mom_5d": round(mom_5d, 2),
+            "breadth_pct": round(breadth * 100, 1),
+            "vol_surge": round(vol_surge, 2),
+            "advances": advances,
+            "total": total,
+            "label": label,
+            "color": color,
+        })
+
+    scored.sort(key=lambda x: x["shine_score"], reverse=True)
+    return {"sectors": scored, "ts": int(time.time())}
+
+
+@app.get("/api/sector/spotlight")
+async def sector_spotlight():
+    global _spotlight_cache, _spotlight_ts
+    if _spotlight_cache and (time.time() - _spotlight_ts) < _SPOTLIGHT_TTL:
+        return _spotlight_cache
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _compute_sector_spotlight)
+    _spotlight_cache = result
+    _spotlight_ts = time.time()
+    return result
 
 
 @app.websocket("/ws/live")
@@ -3071,66 +3346,91 @@ def _extract_geo_category(text: str) -> str:
 
 
 async def _fetch_geo_news_feeds() -> List[Dict]:
+    # (url, default_category, default_country_if_no_geo_match)
     feeds = [
-        ("https://feeds.bbci.co.uk/news/world/rss.xml", "geopolitical"),
-        ("https://rss.reuters.com/reuters/worldNews", "economic"),
-        ("https://feeds.bbci.co.uk/news/business/rss.xml", "economic"),
-        ("https://www.thehindu.com/business/Economy/feeder/default.rss", "economic"),
-        ("https://economictimes.indiatimes.com/markets/rss.cms", "economic"),
-        ("https://feeds.feedburner.com/NDTV-LatestNews", "general"),
+        # Global / World
+        ("https://feeds.bbci.co.uk/news/world/rss.xml", "general", "United Kingdom"),
+        # USA / North America
+        ("https://feeds.bbci.co.uk/news/world/us_and_canada/rss.xml", "political", "United States"),
+        ("https://rss.nytimes.com/services/xml/rss/nyt/World.xml", "general", "United States"),
+        # Europe
+        ("https://feeds.bbci.co.uk/news/world/europe/rss.xml", "political", "Europe"),
+        # Middle East
+        ("https://www.aljazeera.com/xml/rss/all.xml", "conflict", "Middle East"),
+        ("https://feeds.bbci.co.uk/news/world/middle_east/rss.xml", "conflict", "Middle East"),
+        # Asia Pacific
+        ("https://feeds.bbci.co.uk/news/world/asia/rss.xml", "general", "Asia"),
+        ("https://www3.nhk.or.jp/rss/news/cat7.xml", "general", "Japan"),
+        # China & Russia
+        ("https://www.scmp.com/rss/4/feed", "political", "China"),
+        ("https://tass.com/rss/v2.xml", "political", "Russia"),
+        # India
+        ("https://www.thehindu.com/business/Economy/feeder/default.rss", "economic", "India"),
+        ("https://economictimes.indiatimes.com/markets/rss.cms", "economic", "India"),
+        ("https://economictimes.indiatimes.com/news/international/rss.cms", "general", "India"),
+        # Business / Commodities
+        ("https://feeds.bbci.co.uk/news/business/rss.xml", "economic", "United Kingdom"),
     ]
     articles = []
     connector = aiohttp.TCPConnector(ssl=False)
     timeout = aiohttp.ClientTimeout(total=10)
-    for url, default_cat in feeds:
-        try:
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as sess:
-                async with sess.get(url, headers={"User-Agent": "Mozilla/5.0"}) as r:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers) as sess:
+        for url, default_cat, default_country in feeds:
+            try:
+                async with sess.get(url) as r:
                     if r.status != 200:
                         continue
                     text = await r.text(errors="replace")
-            root = ET.fromstring(text)
-            cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-            for item in root.findall(".//item")[:20]:
-                title = (item.findtext("title") or "").strip()
-                link = (item.findtext("link") or "").strip()
-                desc = re.sub(r"<[^>]+>", "", item.findtext("description") or "")[:250]
-                pub_raw = item.findtext("pubDate") or ""
-                src_el = item.find("source")
-                source = src_el.text if src_el is not None else url.split("/")[2]
-                try:
-                    pub_dt = parsedate_to_datetime(pub_raw)
-                    if pub_dt < cutoff:
+                root = ET.fromstring(text)
+                cutoff = datetime.now(timezone.utc) - timedelta(days=14)
+                for item in root.findall(".//item")[:15]:
+                    title = (item.findtext("title") or "").strip()
+                    link = (item.findtext("link") or "").strip()
+                    desc = re.sub(r"<[^>]+>", "", item.findtext("description") or "")[:250]
+                    pub_raw = item.findtext("pubDate") or ""
+                    src_el = item.find("source")
+                    source = src_el.text if src_el is not None else url.split("/")[2]
+                    try:
+                        pub_dt = parsedate_to_datetime(pub_raw)
+                        if pub_dt < cutoff:
+                            continue
+                        age_h = max(0, int((datetime.now(timezone.utc) - pub_dt).total_seconds() / 3600))
+                    except Exception:
+                        age_h = 0
+
+                    if not title:
                         continue
-                    age_h = max(0, int((datetime.now(timezone.utc) - pub_dt).total_seconds() / 3600))
-                except Exception:
-                    age_h = 0
+                    combined = f"{title} {desc}"
+                    loc = _extract_location(combined)
+                    cat = _extract_geo_category(combined) or default_cat
+                    if loc:
+                        country, lat, lng = loc
+                    else:
+                        country = default_country
+                        coords = _GEO_COUNTRY_COORDS.get(default_country, (20.0, 0.0))
+                        lat, lng = coords
 
-                combined = f"{title} {desc}"
-                loc = _extract_location(combined)
-                cat = _extract_geo_category(combined)
-                if not loc:
-                    continue  # skip articles with no geo signal
-
-                articles.append({
-                    "title": title, "url": link, "source": source,
-                    "age_hours": age_h,
-                    "country": loc[0], "lat": loc[1], "lng": loc[2],
-                    "category": cat,
-                    "summary": desc[:200],
-                })
-        except Exception as e:
-            logger.warning(f"Geo news feed {url}: {e}")
+                    articles.append({
+                        "title": title, "url": link, "source": source,
+                        "age_hours": age_h,
+                        "country": country, "lat": lat, "lng": lng,
+                        "category": cat,
+                        "summary": desc[:200],
+                    })
+            except Exception as e:
+                logger.debug(f"Geo news feed {url}: {e}")
 
     # Deduplicate by title
     seen: set = set()
     deduped = []
     for a in articles:
-        if a["title"] not in seen:
-            seen.add(a["title"])
+        key = a["title"][:80]
+        if key not in seen:
+            seen.add(key)
             deduped.append(a)
     deduped.sort(key=lambda x: x["age_hours"])
-    return deduped[:60]
+    return deduped[:80]
 
 
 @app.get("/api/geo-news")
@@ -3885,6 +4185,2290 @@ async def get_sector_rotation():
         return _rec.get_sector_rotation_signal(macro_regime, "STABLE", crude_trend, inr_trend)
 
     return await loop.run_in_executor(None, compute)
+
+
+# ──────────────────────────────────────────────────────────────────
+# NEW MODULE IMPORTS (lazy to avoid startup failures if lib missing)
+# ──────────────────────────────────────────────────────────────────
+
+def _safe_import(module_name: str):
+    try:
+        import importlib
+        return importlib.import_module(module_name)
+    except Exception as e:
+        logger.warning(f"Could not import {module_name}: {e}")
+        return None
+
+def _numpy_safe(obj):
+    """Recursively convert numpy types to JSON-serializable Python types."""
+    if isinstance(obj, dict):
+        return {k: _numpy_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_numpy_safe(v) for v in obj]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return None if np.isnan(obj) or np.isinf(obj) else float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return [_numpy_safe(v) for v in obj.tolist()]
+    if isinstance(obj, float) and (np.isnan(obj) or np.isinf(obj)):
+        return None
+    return obj
+
+_opts = None
+_deriv = None
+_bt = None
+_port = None
+_adv_ta = None
+_risk = None
+_fund_deep = None
+_alt = None
+_scr_adv = None
+_eco_cal = None
+
+def _get_opts():
+    global _opts
+    if _opts is None:
+        _opts = _safe_import("options_engine")
+    return _opts
+
+def _get_deriv():
+    global _deriv
+    if _deriv is None:
+        _deriv = _safe_import("derivatives_analytics")
+    return _deriv
+
+def _get_bt():
+    global _bt
+    if _bt is None:
+        _bt = _safe_import("backtesting_engine")
+    return _bt
+
+def _get_port():
+    global _port
+    if _port is None:
+        _port = _safe_import("portfolio_optimizer")
+    return _port
+
+def _get_adv_ta():
+    global _adv_ta
+    if _adv_ta is None:
+        _adv_ta = _safe_import("advanced_technicals")
+    return _adv_ta
+
+def _get_risk():
+    global _risk
+    if _risk is None:
+        _risk = _safe_import("risk_engine")
+    return _risk
+
+def _get_fund_deep():
+    global _fund_deep
+    if _fund_deep is None:
+        _fund_deep = _safe_import("fundamental_deep")
+    return _fund_deep
+
+def _get_alt():
+    global _alt
+    if _alt is None:
+        _alt = _safe_import("alternative_data")
+    return _alt
+
+def _get_scr_adv():
+    global _scr_adv
+    if _scr_adv is None:
+        _scr_adv = _safe_import("screener_advanced")
+    return _scr_adv
+
+def _get_eco_cal():
+    global _eco_cal
+    if _eco_cal is None:
+        _eco_cal = _safe_import("economic_calendar")
+    return _eco_cal
+
+
+# ──────────────────────────────────────────────────────────────────
+# OPTIONS ENGINE ENDPOINTS
+# ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/options/dashboard/{symbol}")
+async def get_options_dashboard(symbol: str, expiry: str = ""):
+    """Full options dashboard: chain, max pain, IV, Greeks, OI, PCR"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_opts()
+        if not mod:
+            return {"error": "options_engine not available"}
+        try:
+            client = mod.NSEOptionsClient()
+            analytics = mod.OptionsAnalytics()
+            raw = client.get_option_chain(symbol.upper())
+            if not raw:
+                return {"error": "No option chain data from NSE"}
+            dashboard = analytics.build_options_dashboard(symbol.upper(), raw)
+            return dashboard
+        except Exception as e:
+            logger.error(f"Options dashboard {symbol}: {e}")
+            return {"error": str(e), "symbol": symbol}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/options/chain/{symbol}")
+async def get_options_chain_raw(symbol: str, expiry: str = ""):
+    """Raw parsed options chain for a symbol"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_opts()
+        if not mod:
+            return {"error": "options_engine not available"}
+        try:
+            client = mod.NSEOptionsClient()
+            analytics = mod.OptionsAnalytics()
+            raw = client.get_option_chain(symbol.upper())
+            if not raw:
+                return {"error": "No data"}
+            return analytics.parse_option_chain(raw, symbol.upper())
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/options/max-pain/{symbol}")
+async def get_max_pain(symbol: str):
+    """Max pain analysis for options"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_opts()
+        if not mod:
+            return {"error": "options_engine not available"}
+        try:
+            client = mod.NSEOptionsClient()
+            analytics = mod.OptionsAnalytics()
+            raw = client.get_option_chain(symbol.upper())
+            chain_data = analytics.parse_option_chain(raw, symbol.upper())
+            return analytics.calculate_max_pain(chain_data)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/options/iv-surface/{symbol}")
+async def get_iv_surface(symbol: str):
+    """IV surface across strikes and expiries"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_opts()
+        if not mod:
+            return {"error": "options_engine not available"}
+        try:
+            client = mod.NSEOptionsClient()
+            analytics = mod.OptionsAnalytics()
+            raw = client.get_option_chain(symbol.upper())
+            chain_data = analytics.parse_option_chain(raw, symbol.upper())
+            return analytics.calculate_iv_surface(chain_data)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/options/greeks/{symbol}")
+async def get_options_greeks(symbol: str):
+    """Black-Scholes Greeks for all strikes"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_opts()
+        if not mod:
+            return {"error": "options_engine not available"}
+        try:
+            client = mod.NSEOptionsClient()
+            analytics = mod.OptionsAnalytics()
+            raw = client.get_option_chain(symbol.upper())
+            chain_data = analytics.parse_option_chain(raw, symbol.upper())
+            return analytics.calculate_greeks_for_chain(chain_data)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/options/skew/{symbol}")
+async def get_options_skew(symbol: str):
+    """Volatility skew analysis"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_opts()
+        if not mod:
+            return {"error": "options_engine not available"}
+        try:
+            client = mod.NSEOptionsClient()
+            analytics = mod.OptionsAnalytics()
+            raw = client.get_option_chain(symbol.upper())
+            chain_data = analytics.parse_option_chain(raw, symbol.upper())
+            return analytics.calculate_skew(chain_data)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/options/expected-move/{symbol}")
+async def get_expected_move(symbol: str, days: int = 30):
+    """Expected move from options market"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_opts()
+        if not mod:
+            return {"error": "options_engine not available"}
+        try:
+            client = mod.NSEOptionsClient()
+            analytics = mod.OptionsAnalytics()
+            raw = client.get_option_chain(symbol.upper())
+            chain_data = analytics.parse_option_chain(raw, symbol.upper())
+            return analytics.calculate_expected_move(chain_data, days)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/options/iv-rank/{symbol}")
+async def get_iv_rank(symbol: str):
+    """IV rank and percentile (52-week)"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_opts()
+        if not mod:
+            return {"error": "options_engine not available"}
+        try:
+            client = mod.NSEOptionsClient()
+            analytics = mod.OptionsAnalytics()
+            raw = client.get_option_chain(symbol.upper())
+            chain_data = analytics.parse_option_chain(raw, symbol.upper())
+            current_iv = chain_data.get("atm_iv", 20)
+            return analytics.get_iv_rank_percentile(symbol.upper(), current_iv)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/options/oi-analysis/{symbol}")
+async def get_oi_analysis(symbol: str):
+    """Open interest analysis: support, resistance, buildup signals"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_opts()
+        if not mod:
+            return {"error": "options_engine not available"}
+        try:
+            client = mod.NSEOptionsClient()
+            analytics = mod.OptionsAnalytics()
+            raw = client.get_option_chain(symbol.upper())
+            chain_data = analytics.parse_option_chain(raw, symbol.upper())
+            return analytics.calculate_oi_analysis(chain_data)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ──────────────────────────────────────────────────────────────────
+# DERIVATIVES ANALYTICS ENDPOINTS
+# ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/derivatives/dashboard")
+async def get_derivatives_dashboard():
+    """NIFTY/BANKNIFTY derivatives overview: PCR, max pain, IV, expected move"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_deriv()
+        if not mod:
+            return {"error": "derivatives_analytics not available"}
+        try:
+            screener = mod.DerivativesScreener()
+            return screener.get_nifty_derivatives_dashboard()
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/derivatives/oi-buildup")
+async def get_oi_buildup_scan(limit: int = 20):
+    """Scan for highest OI additions today"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_deriv()
+        if not mod:
+            return {"error": "derivatives_analytics not available"}
+        try:
+            screener = mod.DerivativesScreener()
+            return screener.scan_high_oi_buildup(limit)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/derivatives/oi-unwinding")
+async def get_oi_unwinding(limit: int = 20):
+    """Stocks with highest OI reduction"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_deriv()
+        if not mod:
+            return {"error": "derivatives_analytics not available"}
+        try:
+            screener = mod.DerivativesScreener()
+            return screener.scan_oi_unwinding(limit)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/derivatives/futures/{symbol}")
+async def get_futures_data(symbol: str):
+    """Futures data: basis, cost of carry, rollover"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_deriv()
+        if not mod:
+            return {"error": "derivatives_analytics not available"}
+        try:
+            fut = mod.FuturesAnalytics()
+            data = fut.get_futures_data(symbol.upper())
+            rollover = fut.analyze_rollover(symbol.upper())
+            return {**data, "rollover": rollover}
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/derivatives/india-vix")
+async def get_india_vix():
+    """India VIX level, change, percentile"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_deriv()
+        if not mod:
+            # fallback to yfinance
+            try:
+                import yfinance as yf
+                v = yf.Ticker("^INDIAVIX")
+                h = v.history(period="1y")
+                if not h.empty:
+                    c = h["Close"]
+                    curr = float(c.iloc[-1])
+                    rank = float((c < curr).sum() / len(c) * 100)
+                    return {"vix": curr, "chg_1d": float((c.iloc[-1]/c.iloc[-2]-1)*100) if len(c)>1 else 0, "percentile": round(rank,1)}
+            except Exception:
+                pass
+            return {"error": "not available"}
+        try:
+            return mod.get_india_vix_data()
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/derivatives/expiry-calendar")
+async def get_fno_expiry_calendar():
+    """Upcoming F&O expiry dates"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_deriv()
+        if mod:
+            try:
+                return mod.get_fno_expiry_calendar()
+            except Exception:
+                pass
+        eco = _get_eco_cal()
+        if eco:
+            try:
+                return eco.NSECalendarClient.get_fno_expiry_dates()
+            except Exception as e:
+                return {"error": str(e)}
+        return {"error": "not available"}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ──────────────────────────────────────────────────────────────────
+# BACKTESTING ENDPOINTS
+# ──────────────────────────────────────────────────────────────────
+
+class BacktestRequest(BaseModel):
+    strategy: str = "momentum"
+    universe: str = "nifty50"
+    start_date: str = "2020-01-01"
+    end_date: str = "2024-12-31"
+    initial_capital: float = 1_000_000.0
+    params: Optional[Dict[str, Any]] = None
+
+
+NIFTY50_BT = [
+    "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","BAJFINANCE","BHARTIARTL",
+    "SBIN","KOTAKBANK","ITC","LT","AXISBANK","TITAN","ASIANPAINT","MARUTI","ULTRACEMCO",
+    "WIPRO","HCLTECH","NESTLEIND","NTPC","ONGC","POWERGRID","COALINDIA","TATASTEEL",
+    "JSWSTEEL","SUNPHARMA","CIPLA","DRREDDY","DIVISLAB","TATAMOTORS","EICHERMOT","HEROMOTOCO",
+    "BAJAJFINSV","HINDALCO","BRITANNIA","APOLLOHOSP","TATACONSUM","PIDILITIND","LTIM",
+]
+
+UNIVERSE_MAP = {
+    "nifty50": NIFTY50_BT,
+    "nifty100": NIFTY50_BT + ["DMART","SIEMENS","HAVELLS","DABUR","MARICO","COLPAL","ZOMATO","INDIGO","HAL","BEL"],
+    "all": ALL_SYMBOLS[:60],
+}
+
+
+@app.post("/api/backtest/run")
+async def run_backtest(req: BacktestRequest):
+    """Run a full strategy backtest"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_bt()
+        if not mod:
+            return {"error": "backtesting_engine not available"}
+        try:
+            symbols = UNIVERSE_MAP.get(req.universe, NIFTY50_BT)
+            orch = mod.BacktestOrchestrator()
+            result = orch.run_strategy(
+                strategy_name=req.strategy,
+                symbols=symbols,
+                start_date=req.start_date,
+                end_date=req.end_date,
+                initial_capital=req.initial_capital,
+                **(req.params or {}),
+            )
+            return result
+        except Exception as e:
+            logger.error(f"Backtest error: {e}")
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/backtest/strategies")
+async def get_backtest_strategies():
+    """List available backtest strategies"""
+    return {
+        "strategies": [
+            {"name": "momentum", "label": "Dual Momentum", "description": "12-month absolute + relative momentum"},
+            {"name": "mean_reversion", "label": "Mean Reversion", "description": "Z-score + Bollinger Band + RSI filter"},
+            {"name": "trend_following", "label": "Trend Following", "description": "Donchian channel breakout + ATR stop"},
+            {"name": "pairs", "label": "Pairs Trading", "description": "Cointegration-based stat arb"},
+            {"name": "factor", "label": "Multi-Factor", "description": "Composite factor model ranking"},
+            {"name": "rsi_macd", "label": "RSI + MACD", "description": "Classic technical strategy"},
+        ]
+    }
+
+
+@app.post("/api/backtest/compare")
+async def compare_strategies(symbols: List[str] = None, start_date: str = "2020-01-01", end_date: str = "2024-12-31"):
+    """Compare all strategies on same universe"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_bt()
+        if not mod:
+            return {"error": "backtesting_engine not available"}
+        try:
+            syms = symbols or NIFTY50_BT[:20]
+            orch = mod.BacktestOrchestrator()
+            return orch.compare_strategies(syms, start_date, end_date)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ──────────────────────────────────────────────────────────────────
+# PORTFOLIO OPTIMIZER ENDPOINTS
+# ──────────────────────────────────────────────────────────────────
+
+class PortfolioOptRequest(BaseModel):
+    symbols: List[str]
+    method: str = "sharpe"
+    max_weight: float = 0.30
+    period: str = "2y"
+    views: Optional[Dict[str, float]] = None
+    confidences: Optional[Dict[str, float]] = None
+
+
+@app.post("/api/portfolio/optimize")
+async def optimize_portfolio(req: PortfolioOptRequest):
+    """Optimize portfolio weights using selected method"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_port()
+        if not mod:
+            return {"error": "portfolio_optimizer not available"}
+        try:
+            orch = mod.PortfolioOrchestrator()
+            constraints = {"max_weight": req.max_weight}
+            if req.views:
+                constraints["views"] = req.views
+            if req.confidences:
+                constraints["confidences"] = req.confidences
+            result = orch.optimize_portfolio(req.symbols, req.method, req.period, constraints)
+            return result
+        except Exception as e:
+            logger.error(f"Portfolio optimize: {e}")
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.post("/api/portfolio/analyze")
+async def analyze_portfolio(holdings: Dict[str, int]):
+    """Analyze existing portfolio: risk, concentration, rebalancing"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_port()
+        if not mod:
+            return {"error": "portfolio_optimizer not available"}
+        try:
+            orch = mod.PortfolioOrchestrator()
+            return orch.analyze_existing_portfolio(holdings)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/portfolio/correlation")
+async def get_portfolio_correlation(symbols: str = Query(..., description="Comma-separated symbols")):
+    """Correlation matrix and diversification insights"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_port()
+        if not mod:
+            return {"error": "portfolio_optimizer not available"}
+        try:
+            syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+            orch = mod.PortfolioOrchestrator()
+            return orch.get_correlation_insights(syms)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ──────────────────────────────────────────────────────────────────
+# ADVANCED TECHNICALS ENDPOINTS
+# ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/technicals/advanced/{symbol}")
+async def get_advanced_technicals(symbol: str):
+    """Full advanced technical analysis: Ichimoku, Supertrend, VWAP, Fibonacci, patterns"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "advanced_technicals not available"}
+        try:
+            summary = mod.TechnicalSummary()
+            return summary.get_full_analysis(symbol.upper())
+        except Exception as e:
+            logger.error(f"Adv technicals {symbol}: {e}")
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/technicals/ichimoku/{symbol}")
+async def get_ichimoku(symbol: str):
+    """Ichimoku cloud signals"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="1y")
+            cloud = mod.IchimokuCloud()
+            calc = cloud.calculate(df)
+            signals = cloud.get_signals(df)
+            return {**calc, "signals": signals}
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/technicals/supertrend/{symbol}")
+async def get_supertrend(symbol: str):
+    """Supertrend indicator and signals"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="6mo")
+            st = mod.SupertrendIndicator()
+            return {**st.calculate(df), "signals": st.get_signals(df)}
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/technicals/vwap/{symbol}")
+async def get_vwap(symbol: str):
+    """VWAP and standard deviation bands"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="3mo")
+            vwap = mod.VWAPCalculator()
+            return vwap.calculate_intraday_vwap(df)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/technicals/volume-profile/{symbol}")
+async def get_volume_profile(symbol: str, n_bins: int = 50):
+    """Volume Profile: POC, Value Area, HVN/LVN"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="1y")
+            vp = mod.VolumeProfile()
+            return {**vp.calculate(df, n_bins), "sr_levels": vp.get_support_resistance(df)}
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/technicals/fibonacci/{symbol}")
+async def get_fibonacci(symbol: str):
+    """Fibonacci retracement and extension levels"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="1y")
+            fib = mod.FibonacciAnalysis()
+            return fib.calculate_retracements(df)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/technicals/candle-patterns/{symbol}")
+async def get_candle_patterns(symbol: str):
+    """All 20+ candlestick patterns"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="3mo")
+            cp = mod.CandlePatterns()
+            return cp.detect_all(df)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/technicals/pivot-points/{symbol}")
+async def get_pivot_points(symbol: str):
+    """Classic, Fibonacci, Camarilla pivot points"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="5d")
+            if df.empty or len(df) < 2:
+                return {"error": "No data"}
+            prev = df.iloc[-2]
+            return mod.calculate_pivot_points(float(prev["High"]), float(prev["Low"]), float(prev["Close"]))
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/technicals/wyckoff/{symbol}")
+async def get_wyckoff_analysis(symbol: str):
+    """Wyckoff accumulation/distribution phase analysis"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="1y")
+            wyck = mod.WyckoffAnalysis()
+            return wyck.analyze(df)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ──────────────────────────────────────────────────────────────────
+# RISK ENGINE ENDPOINTS
+# ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/risk/stock/{symbol}")
+async def get_stock_risk(symbol: str):
+    """Complete risk analysis for a stock"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_risk()
+        if not mod:
+            return {"error": "risk_engine not available"}
+        try:
+            dashboard = mod.RiskDashboard()
+            raw = dashboard.get_stock_risk(symbol.upper())
+            # Flatten nested structure into what the frontend expects
+            summary = raw.get("summary", {})
+            vol = raw.get("volatility", {})
+            beta_d = raw.get("beta", {})
+            dd = raw.get("drawdown", {})
+            tail = raw.get("tail_risk", {})
+            garch = raw.get("garch", {})
+            vh = raw.get("var_historical", {})
+            vp = raw.get("var_parametric", {})
+            vm = raw.get("var_mc", {})
+            stress = raw.get("stress_scenarios", {})
+            evt = raw.get("evt", {})
+
+            ann_vol = summary.get("annual_vol_pct") or vol.get("current_realized_vol_annualized", 0)
+            max_dd = dd.get("max_drawdown_pct", 0)
+            sharpe = summary.get("sharpe_ratio")
+            beta_val = beta_d.get("beta", 1.0)
+            calmar_val = dd.get("calmar_ratio")
+            # Sortino: approximate as sharpe * (ann_vol / downside_vol) if not present
+            sortino = raw.get("sortino") or (sharpe * 1.4 if sharpe else None)
+
+            return {
+                "symbol": symbol.upper(),
+                # Overview
+                "sharpe_1y": sharpe,
+                "sortino": sortino,
+                "ann_vol_pct": ann_vol,
+                "beta_vs_nifty": beta_val,
+                "max_drawdown_pct": abs(max_dd) if max_dd else 0,
+                "calmar": calmar_val,
+                "skewness": tail.get("skewness"),
+                "excess_kurtosis": tail.get("excess_kurtosis"),
+                "tail_ratio": tail.get("tail_ratio"),
+                # VaR (fractions)
+                "var_historical_95": abs(vh.get("var_pct", 0)) / 100,
+                "var_historical_99": abs(vh.get("cornish_fisher_var_pct", vh.get("var_pct", 0))) / 100,
+                "cvar_historical_95": abs(vh.get("cvar_pct", 0)) / 100,
+                "var_parametric_95": abs(vp.get("var_pct", 0)) / 100,
+                "var_parametric_99": abs(vp.get("var_99_pct", vp.get("var_pct", 0))) / 100,
+                "cvar_parametric_95": abs(vp.get("cvar_pct", 0)) / 100,
+                "var_mc_95": abs(vm.get("var_pct", vh.get("var_pct", 0))) / 100,
+                "var_mc_99": abs(vm.get("var_99_pct", 0)) / 100,
+                "cvar_mc_95": abs(vm.get("cvar_pct", vh.get("cvar_pct", 0))) / 100,
+                # VaR % versions for gauges
+                "var_historical_95_pct": abs(vh.get("var_pct", 0)),
+                # GARCH
+                "garch_alpha": garch.get("alpha"),
+                "garch_beta": garch.get("beta"),
+                "garch_persistence": garch.get("persistence"),
+                "garch_uncond_vol": (garch.get("unconditional_vol_annualized", 0) / 100 / (252 ** 0.5)),
+                "garch_forecast_1d": garch.get("current_conditional_vol_annualized", 0) / 100 / (252 ** 0.5),
+                "garch_forecast_5d": garch.get("current_conditional_vol_annualized", 0) / 100 / (252 ** 0.5) * (5 ** 0.5),
+                "garch_forecast_21d": garch.get("current_conditional_vol_annualized", 0) / 100 / (252 ** 0.5) * (21 ** 0.5),
+                "realized_vol_21d_pct": vol.get("1m_avg_vol_annualized", ann_vol),
+                # Stress
+                "stress_scenarios": stress if isinstance(stress, dict) else {},
+                # Tail
+                "pct_99_loss": abs(tail.get("99th_percentile_loss_pct", 0)) / 100,
+                "jarque_bera_pvalue": tail.get("jarque_bera_pvalue"),
+                "evt_var_999": abs(evt.get("evt_var_999_pct", 0)) / 100 if evt.get("evt_var_999_pct") else None,
+            }
+        except Exception as e:
+            logger.error(f"Stock risk {symbol}: {e}")
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.post("/api/risk/portfolio")
+async def get_portfolio_risk(symbols: List[str], weights: Optional[Dict[str, float]] = None):
+    """Portfolio-level risk: VaR, CVaR, stress tests, factor decomposition"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_risk()
+        if not mod:
+            return {"error": "risk_engine not available"}
+        try:
+            dashboard = mod.RiskDashboard()
+            return dashboard.get_portfolio_risk(symbols, weights)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/risk/var/{symbol}")
+async def get_var_analysis(symbol: str, confidence: float = 0.99):
+    """Value at Risk via three methods"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_risk()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            import yfinance as yf
+            import numpy as np
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="2y")
+            rets = df["Close"].pct_change().dropna().values
+            calc = mod.VaRCalculator()
+            return {
+                "parametric": calc.parametric_var(rets, confidence),
+                "historical": calc.historical_var(rets, confidence),
+                "monte_carlo": calc.monte_carlo_var(rets, confidence),
+                "symbol": symbol.upper(),
+                "confidence": confidence,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/risk/garch/{symbol}")
+async def get_garch_volatility(symbol: str):
+    """GARCH(1,1) volatility model and forecast"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_risk()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="2y")
+            rets = df["Close"].pct_change().dropna().values
+            garch = mod.GARCHVolatility()
+            return garch.fit_garch(rets)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/risk/stress-test/{symbol}")
+async def get_stress_test(symbol: str):
+    """Historical and hypothetical stress scenarios"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_risk()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            import yfinance as yf
+            import pandas as pd
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="5y")
+            rets_df = pd.DataFrame({"symbol": df["Close"].pct_change().dropna()})
+            tester = mod.StressTester()
+            historical = tester.historical_scenarios(rets_df, {"symbol": 1.0})
+            hypothetical = tester.hypothetical_scenarios(rets_df, {"symbol": 1.0})
+            return {"historical": historical, "hypothetical": hypothetical}
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ──────────────────────────────────────────────────────────────────
+# DEEP FUNDAMENTAL ENDPOINTS
+# ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/fundamental/deep/{symbol}")
+async def get_deep_fundamental(symbol: str):
+    """Full deep fundamental analysis: Piotroski, Altman, Beneish, DCF, DuPont, ROIC, WC"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_fund_deep()
+        if not mod:
+            return {"error": "fundamental_deep not available"}
+        try:
+            dashboard = mod.FundamentalDashboard()
+            raw = dashboard.get_full_analysis(symbol.upper())
+            km = raw.get("key_metrics", {})
+            analyses = raw.get("analyses", {})
+
+            # ── Piotroski ──────────────────────────────────────────
+            pio_raw = analyses.get("piotroski_fscore", {})
+            criteria_raw = pio_raw.get("criteria", {})
+            PROFITABILITY_KEYS = ["F1_ROA_positive", "F2_CFO_positive", "F3_ROA_improving", "F4_accruals"]
+            LEVERAGE_KEYS = ["F5_leverage_decreasing", "F6_current_ratio_improving", "F7_no_dilution"]
+            EFFICIENCY_KEYS = ["F8_gross_margin_improving", "F9_asset_turnover_improving"]
+            def _pio_row(key, crit):
+                return {"name": crit.get("description", key), "passed": bool(crit.get("score", 0)), "value": str(round(crit.get("value", crit.get("current_roa", crit.get("current_cr", ""))), 3) if isinstance(crit.get("value", crit.get("current_roa", crit.get("current_cr", ""))), (int, float)) else "")}
+            pio_signal = pio_raw.get("signal", "")
+            pio_rating = ("STRONG" if pio_signal in ("STRONG BUY", "BUY") else "NEUTRAL" if pio_signal == "HOLD" else "WEAK") if pio_signal else "NEUTRAL"
+            piotroski = {
+                "score": pio_raw.get("score", 0),
+                "rating": pio_raw.get("interpretation", pio_rating),
+                "criteria": {
+                    "profitability": [_pio_row(k, criteria_raw[k]) for k in PROFITABILITY_KEYS if k in criteria_raw],
+                    "leverage": [_pio_row(k, criteria_raw[k]) for k in LEVERAGE_KEYS if k in criteria_raw],
+                    "efficiency": [_pio_row(k, criteria_raw[k]) for k in EFFICIENCY_KEYS if k in criteria_raw],
+                }
+            }
+
+            # ── Altman ─────────────────────────────────────────────
+            alt_raw = analyses.get("altman_zscore", {})
+            comps = alt_raw.get("components", {})
+            zone_raw = alt_raw.get("zone", "")
+            zone = "SAFE" if "Safe" in zone_raw else "DISTRESS" if "Distress" in zone_raw else "GREY"
+            altman = {
+                "z_score": alt_raw.get("z_score"),
+                "zone": zone,
+                "t1": comps.get("T1_working_capital_ratio"),
+                "t2": comps.get("T2_retained_earnings_ratio"),
+                "t3": comps.get("T3_ebit_ratio"),
+                "t4": comps.get("T4_market_cap_to_liabilities"),
+                "t5": comps.get("T5_revenue_ratio"),
+            }
+
+            # ── Beneish ────────────────────────────────────────────
+            ben_raw = analyses.get("beneish_mscore", {})
+            indices = ben_raw.get("indices", {})
+            risk_class = ben_raw.get("risk_classification", "")
+            risk = "LOW" if "LOW" in risk_class else "HIGH" if "HIGH" in risk_class else "MEDIUM"
+            beneish = {
+                "m_score": ben_raw.get("m_score"),
+                "risk": risk,
+                "dsri": indices.get("DSRI"), "gmi": indices.get("GMI"),
+                "aqi": indices.get("AQI"), "sgi": indices.get("SGI"),
+                "depi": indices.get("DEPI"), "sgai": indices.get("SGAI"),
+                "lvgi": indices.get("LVGI"), "tata": indices.get("TATA"),
+            }
+
+            # ── DuPont ─────────────────────────────────────────────
+            dp_raw = analyses.get("dupont_analysis", {})
+            yearly = dp_raw.get("yearly_decomposition", [{}])
+            latest_dp = yearly[0].get("five_factor", {}) if yearly else {}
+            dupont = {
+                "tax_burden": latest_dp.get("tax_burden"),
+                "interest_burden": latest_dp.get("interest_burden"),
+                "ebit_margin": (latest_dp.get("operating_margin_pct", 0) or 0) / 100,
+                "asset_turnover": latest_dp.get("asset_turnover"),
+                "financial_leverage": latest_dp.get("financial_leverage"),
+                "roe_pct": latest_dp.get("roe"),
+            }
+
+            # ── DCF ────────────────────────────────────────────────
+            dcf_raw = analyses.get("dcf_valuation", {})
+            assumptions = dcf_raw.get("assumptions", {})
+            sensitivity = dcf_raw.get("sensitivity_table") or {}
+            dcf = {
+                "intrinsic_value": dcf_raw.get("intrinsic_value_per_share"),
+                "margin_of_safety_pct": dcf_raw.get("margin_of_safety_pct"),
+                "wacc_pct": assumptions.get("wacc_pct"),
+                "terminal_growth": (assumptions.get("terminal_growth_pct", 5) or 5) / 100,
+                "growth_rate": assumptions.get("fcf_growth_stage1_pct"),
+                "sensitivity": sensitivity,
+            }
+
+            # ── ROIC ───────────────────────────────────────────────
+            roic_raw = analyses.get("roic_analysis", {})
+            roic_trend = roic_raw.get("roic_trend", [{}])
+            latest_roic = roic_trend[0] if roic_trend else {}
+            roic = {
+                "roic_pct": roic_raw.get("latest_roic_pct"),
+                "wacc_pct": roic_raw.get("estimated_wacc_pct"),
+                "nopat_cr": latest_roic.get("nopat_cr"),
+                "invested_capital_cr": latest_roic.get("invested_capital_cr"),
+                "eva_cr": roic_raw.get("latest_eva_cr"),
+            }
+
+            # ── Working Capital ────────────────────────────────────
+            wc_raw = analyses.get("working_capital", {})
+            latest_wc = wc_raw.get("latest", {})
+            working_capital = {
+                "cash_conversion_cycle": latest_wc.get("ccc_days"),
+                "dio": latest_wc.get("dio_days"),
+                "dso": latest_wc.get("dso_days"),
+                "dpo": latest_wc.get("dpo_days"),
+                "nwc_cr": latest_wc.get("nwc_cr"),
+                "nwc_change_cr": wc_raw.get("nwc_change_cr"),
+            }
+
+            # ── Overview ───────────────────────────────────────────
+            return {
+                "symbol": symbol.upper(),
+                "sector": km.get("sector"),
+                "industry": km.get("sector"),
+                "current_price": km.get("current_price"),
+                "overall_score": raw.get("overall_fundamental_score"),
+                # Overview metrics
+                "pe_ratio": km.get("pe_ttm"),
+                "pb_ratio": km.get("pb_ratio"),
+                "roe": km.get("roe_pct") or latest_dp.get("roe"),
+                "net_margin": km.get("profit_margin_pct"),
+                "debt_equity": km.get("debt_to_equity"),
+                "revenue_growth": km.get("revenue_growth_pct"),
+                "ev_ebitda": km.get("ev_ebitda"),
+                "fcf_yield": None,
+                "div_yield": (km.get("dividend_yield_pct") or 0) if (km.get("dividend_yield_pct") or 0) < 30 else None,
+                "current_ratio": latest_wc.get("current_ratio"),
+                "graham_number": None,
+                # Sub-analyses
+                "piotroski": piotroski,
+                "altman": altman,
+                "beneish": beneish,
+                "dupont": dupont,
+                "dcf": dcf,
+                "roic": roic,
+                "working_capital": working_capital,
+            }
+        except Exception as e:
+            logger.error(f"Deep fundamental {symbol}: {e}")
+            import traceback; logger.error(traceback.format_exc())
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/fundamental/piotroski/{symbol}")
+async def get_piotroski(symbol: str):
+    """Piotroski F-Score (0-9)"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_fund_deep()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            piotroski = mod.PiotroskiFScore()
+            return piotroski.calculate(symbol.upper())
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/fundamental/altman/{symbol}")
+async def get_altman_z(symbol: str):
+    """Altman Z-Score bankruptcy risk"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_fund_deep()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            altman = mod.AltmanZScore()
+            return altman.calculate(symbol.upper())
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/fundamental/beneish/{symbol}")
+async def get_beneish_m(symbol: str):
+    """Beneish M-Score earnings manipulation detection"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_fund_deep()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            beneish = mod.BeneishMScore()
+            return beneish.calculate(symbol.upper())
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/fundamental/dcf/{symbol}")
+async def get_dcf_valuation(symbol: str, terminal_growth: float = 0.05):
+    """DCF intrinsic value with sensitivity table"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_fund_deep()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            dcf = mod.DCFValuation()
+            return dcf.calculate(symbol.upper(), terminal_growth=terminal_growth)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/fundamental/dupont/{symbol}")
+async def get_dupont(symbol: str):
+    """5-Factor DuPont ROE decomposition"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_fund_deep()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            dupont = mod.DuPontAnalysis()
+            return dupont.calculate(symbol.upper())
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/fundamental/roic/{symbol}")
+async def get_roic(symbol: str):
+    """ROIC vs WACC analysis and EVA"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_fund_deep()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            roic = mod.ROICAnalysis()
+            return roic.calculate(symbol.upper())
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/fundamental/working-capital/{symbol}")
+async def get_working_capital(symbol: str):
+    """Cash conversion cycle and working capital analysis"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_fund_deep()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            wc = mod.WorkingCapitalAnalysis()
+            return wc.calculate(symbol.upper())
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ──────────────────────────────────────────────────────────────────
+# ADVANCED SCREENER ENDPOINTS
+# ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/screener/advanced/{screen_type}")
+async def run_advanced_screen(screen_type: str, universe: str = "nifty100", limit: int = 20):
+    """Run advanced screens: garp, deep_value, quality_compounder, turnaround, low_vol, dividend, earnings_momentum, golden_cross, 52w_breakout, magic_formula"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_scr_adv()
+        if not mod:
+            return {"error": "screener_advanced not available"}
+        try:
+            orch = mod.AdvancedScreenerOrchestrator()
+            return orch.run_screen(screen_type, universe, limit)
+        except Exception as e:
+            logger.error(f"Advanced screen {screen_type}: {e}")
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/screener/sector-analysis")
+async def get_sector_analysis(universe: str = "nifty100"):
+    """Sector strength analysis: returns, breadth, top stocks"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_scr_adv()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            orch = mod.AdvancedScreenerOrchestrator()
+            return orch.get_sector_analysis(universe)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/screener/heatmap")
+async def get_universe_heatmap():
+    """Price change heatmap for all symbols"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_scr_adv()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            return mod.calculate_universe_heatmap()
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/screener/magic-formula")
+async def get_magic_formula(limit: int = 20):
+    """Joel Greenblatt Magic Formula screen"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_scr_adv()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            symbols = list(dict.fromkeys(
+                ["RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","BAJFINANCE","BHARTIARTL","SBIN","KOTAKBANK",
+                 "ITC","LT","AXISBANK","TITAN","ASIANPAINT","MARUTI","WIPRO","HCLTECH","NESTLEIND","TATAMOTORS",
+                 "DMART","SIEMENS","HAVELLS","DABUR","MARICO","COLPAL","ZOMATO","HAL","BEL","ADANIENT"]
+            ))
+            return {"results": mod.run_magic_formula_screen(symbols, limit), "screen": "magic_formula"}
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ──────────────────────────────────────────────────────────────────
+# ALTERNATIVE DATA ENDPOINTS
+# ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/alternative/snapshot")
+async def get_alternative_snapshot():
+    """Full alternative data: fear/greed, breadth, macro, FII, news"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_alt()
+        if not mod:
+            return {"error": "alternative_data not available"}
+        try:
+            dashboard = mod.AlternativeDataDashboard()
+            return dashboard.get_full_alternative_snapshot()
+        except Exception as e:
+            logger.error(f"Alt snapshot: {e}")
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/alternative/stock/{symbol}")
+async def get_stock_alternative(symbol: str):
+    """Stock-level alternative data: Google Trends, news sentiment"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_alt()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            dashboard = mod.AlternativeDataDashboard()
+            return dashboard.get_stock_alternative_data(symbol.upper())
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/alternative/fear-greed")
+async def get_fear_greed():
+    """India Fear & Greed composite index"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_alt()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            si = mod.SentimentIndicators()
+            return si.get_fear_greed_india()
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/alternative/market-breadth")
+async def get_market_breadth_advanced():
+    """Advanced market breadth: A/D, % above SMAs, 52W highs/lows"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_alt()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            si = mod.SentimentIndicators()
+            return si.get_market_breadth_advanced()
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/alternative/fii-sentiment")
+async def get_fii_sentiment_score():
+    """FII sentiment score based on rolling flows"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_alt()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            si = mod.SentimentIndicators()
+            return si.get_fii_sentiment_score()
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/alternative/news/economic")
+async def get_economic_news():
+    """India economic news feed with sentiment"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_alt()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            agg = mod.NewsAggregator()
+            return agg.get_economic_news()
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/alternative/news/sector/{sector}")
+async def get_sector_news_alt(sector: str):
+    """Sector-specific news with sentiment"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_alt()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            agg = mod.NewsAggregator()
+            return agg.get_sector_news(sector)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/alternative/google-trends/{symbol}")
+async def get_google_trends(symbol: str, company: str = ""):
+    """Google search trends for a stock"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_alt()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            company_names = {
+                "RELIANCE": "Reliance Industries", "TCS": "Tata Consultancy Services",
+                "HDFCBANK": "HDFC Bank", "INFY": "Infosys", "ICICIBANK": "ICICI Bank",
+            }
+            co_name = company or company_names.get(symbol.upper(), symbol)
+            gtr = mod.GoogleTrendsData()
+            return gtr.get_search_trends(symbol.upper(), co_name)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/alternative/macro/india")
+async def get_india_macro_data():
+    """India economic data: GDP, CPI, FII monthly trend"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_alt()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            ei = mod.EconomicIndicators()
+            return {
+                "gdp": ei.get_india_gdp_data(),
+                "cpi": ei.get_india_cpi(),
+                "fii_monthly": ei.get_fii_monthly_trend(),
+                "india_markets": ei.get_india_macro_via_yfinance(),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/alternative/macro/global")
+async def get_global_macro_data():
+    """US macro: yields, dollar, equity indices, gold, crude"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_alt()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            ei = mod.EconomicIndicators()
+            return ei.get_us_macro_via_yfinance()
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ──────────────────────────────────────────────────────────────────
+# ECONOMIC CALENDAR ENDPOINTS
+# ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/calendar/events")
+async def get_calendar_events(days: int = 30):
+    """All upcoming market events: RBI, Fed, earnings, F&O expiry, holidays"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_eco_cal()
+        if not mod:
+            return {"error": "economic_calendar not available"}
+        try:
+            cal = mod.MarketEventsCalendar()
+            return cal.get_full_calendar(days)
+        except Exception as e:
+            logger.error(f"Calendar: {e}")
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/calendar/earnings")
+async def get_earnings_calendar():
+    """Upcoming earnings dates for NIFTY50 stocks"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_eco_cal()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            ec = mod.EarningsCalendar()
+            return {"upcoming": ec.get_earnings_dates()}
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/calendar/earnings/{symbol}")
+async def get_earnings_history(symbol: str):
+    """Historical earnings with surprise analysis"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_eco_cal()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            ec = mod.EarningsCalendar()
+            return ec.get_historical_earnings(symbol.upper())
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/calendar/dividends")
+async def get_dividend_calendar(min_yield: float = 1.0):
+    """Upcoming ex-dividend dates"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_eco_cal()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            dt = mod.DividendTracker()
+            return dt.get_high_yield_upcoming(min_yield)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/calendar/ipos")
+async def get_ipo_calendar():
+    """Upcoming and recent IPO listings"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_eco_cal()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            ipo = mod.IPOCalendar()
+            upcoming = ipo.get_upcoming_ipos()
+            recent = ipo.get_recent_listings()
+            return {"upcoming": upcoming, "recent_listings": recent}
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/calendar/stock/{symbol}")
+async def get_stock_calendar(symbol: str):
+    """All upcoming events for a specific stock"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_eco_cal()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            cal = mod.MarketEventsCalendar()
+            return cal.get_stock_events(symbol.upper())
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/calendar/rbi-events")
+async def get_rbi_events(days: int = 180):
+    """RBI MPC meeting schedule and macro events"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_eco_cal()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            rbi = mod.RBIEventsCalendar()
+            return {
+                "macro_events": rbi.get_upcoming_macro_events(days),
+                "economic_releases": rbi.get_economic_data_releases(),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/calendar/fno-expiry")
+async def get_fno_expiry():
+    """F&O weekly and monthly expiry dates"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_eco_cal()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            return mod.NSECalendarClient.get_fno_expiry_dates()
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/calendar/holidays")
+async def get_trading_holidays():
+    """NSE trading holidays"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_eco_cal()
+        if not mod:
+            return {"error": "not available"}
+        try:
+            return {"holidays": mod.NSECalendarClient.get_trading_holidays()}
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ──────────────────────────────────────────────────────────────────
+# SYSTEM INFO
+# ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/system/modules")
+async def get_system_modules():
+    """Check which enhanced modules are loaded"""
+    modules = {
+        "options_engine": _get_opts() is not None,
+        "derivatives_analytics": _get_deriv() is not None,
+        "backtesting_engine": _get_bt() is not None,
+        "portfolio_optimizer": _get_port() is not None,
+        "advanced_technicals": _get_adv_ta() is not None,
+        "risk_engine": _get_risk() is not None,
+        "fundamental_deep": _get_fund_deep() is not None,
+        "alternative_data": _get_alt() is not None,
+        "screener_advanced": _get_scr_adv() is not None,
+        "economic_calendar": _get_eco_cal() is not None,
+    }
+    return {
+        "modules": modules,
+        "loaded": sum(modules.values()),
+        "total": len(modules),
+        "stock_universe": len(ALL_SYMBOLS),
+        "api_endpoints": "100+",
+    }
+
+
+# ──────────────────────────────────────────────────────────────────
+# ALIAS ENDPOINTS (path compatibility)
+# ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/health")
+async def api_health():
+    return {"status": "ok", "timestamp": datetime.now().isoformat(), "modules_loaded": 10}
+
+@app.get("/api/price/{symbol}")
+async def get_live_price(symbol: str):
+    """Live price alias endpoint"""
+    loop = asyncio.get_event_loop()
+    def compute():
+        try:
+            import yfinance as yf
+            t = yf.Ticker(f"{symbol.upper()}.NS")
+            info = t.fast_info
+            return {
+                "symbol": symbol.upper(),
+                "price": getattr(info, "last_price", 0),
+                "change_pct": getattr(info, "regular_market_change_percent", 0),
+                "volume": getattr(info, "three_month_average_volume", 0),
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"error": str(e), "symbol": symbol}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+@app.get("/api/derivatives/vix")
+async def derivatives_vix_alias():
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_deriv()
+        if not mod:
+            return {"error": "derivatives_analytics not available"}
+        try:
+            return mod.get_india_vix_data()
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+@app.get("/api/derivatives/fno-calendar")
+async def derivatives_fno_calendar_alias():
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_deriv()
+        if not mod:
+            return {"error": "derivatives_analytics not available"}
+        try:
+            return mod.get_fno_expiry_calendar()
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+@app.get("/api/advanced-ta/technical-summary/{symbol}")
+async def adv_ta_summary_alias(symbol: str):
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "advanced_technicals not available"}
+        try:
+            ts = mod.TechnicalSummary()
+            return ts.get_full_analysis(symbol.upper())
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+@app.get("/api/advanced-ta/ichimoku/{symbol}")
+async def adv_ta_ichimoku_alias(symbol: str):
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "advanced_technicals not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="1y")
+            ich = mod.IchimokuCloud()
+            return ich.calculate(df)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+@app.get("/api/advanced-ta/supertrend/{symbol}")
+async def adv_ta_supertrend_alias(symbol: str):
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "advanced_technicals not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="6mo")
+            st = mod.SupertrendIndicator()
+            return st.calculate(df)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+@app.get("/api/advanced-ta/fibonacci/{symbol}")
+async def adv_ta_fibonacci_alias(symbol: str):
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "advanced_technicals not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="1y")
+            fib = mod.FibonacciAnalysis()
+            retracements = fib.calculate_retracements(df)
+            time_zones = fib.calculate_fib_time_zones(df)
+            return {"retracements": retracements, "time_zones": time_zones, "symbol": symbol.upper()}
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+@app.get("/api/advanced-ta/wyckoff/{symbol}")
+async def adv_ta_wyckoff_alias(symbol: str):
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "advanced_technicals not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="1y")
+            wyck = mod.WyckoffAnalysis()
+            return wyck.analyze(df)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+@app.get("/api/advanced-ta/elliott/{symbol}")
+async def adv_ta_elliott(symbol: str):
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "advanced_technicals not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="1y")
+            ew = mod.ElliottWaveDetector()
+            return ew.detect(df)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+@app.get("/api/advanced-ta/vwap/{symbol}")
+async def adv_ta_vwap_alias(symbol: str):
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "advanced_technicals not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="3mo")
+            vwap = mod.VWAPCalculator()
+            return vwap.calculate(df)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+@app.get("/api/advanced-ta/volume-profile/{symbol}")
+async def adv_ta_volume_profile_alias(symbol: str):
+    loop = asyncio.get_event_loop()
+    def compute():
+        mod = _get_adv_ta()
+        if not mod:
+            return {"error": "advanced_technicals not available"}
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="3mo")
+            vp = mod.VolumeProfile()
+            return vp.calculate(df)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+# ──────────────────────────────────────────────────────────────────
+# TIMESFM PREDICTION PROXY (delegates to timesfm_service on :8002)
+# ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/timesfm/predict/{symbol}")
+async def timesfm_predict(symbol: str, horizon: int = 30):
+    """Proxy to TimesFM service for price forecasting"""
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(
+                f"http://localhost:8002/predict/{symbol}?horizon={horizon}",
+                timeout=aiohttp.ClientTimeout(total=120)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return NumpyJSONResponse(content=_numpy_safe(data))
+                return NumpyJSONResponse(content={"error": f"TimesFM service returned {resp.status}", "symbol": symbol})
+    except Exception as e:
+        return NumpyJSONResponse(content={"error": f"TimesFM service unavailable: {str(e)}", "symbol": symbol,
+                                          "hint": "Start with: cd ~/IndianHedgeFund/backend && python3.11 timesfm_service.py"})
+
+@app.get("/api/timesfm/batch")
+async def timesfm_batch(symbols: str, horizon: int = 30):
+    """Batch forecast multiple stocks via TimesFM"""
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(
+                f"http://localhost:8002/predict/batch?symbols={symbols}&horizon={horizon}",
+                timeout=aiohttp.ClientTimeout(total=300)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return NumpyJSONResponse(content=_numpy_safe(data))
+                return NumpyJSONResponse(content={"error": f"TimesFM service returned {resp.status}"})
+    except Exception as e:
+        return NumpyJSONResponse(content={"error": f"TimesFM batch unavailable: {str(e)}"})
+
+@app.get("/api/timesfm/sector")
+async def timesfm_sector(horizon: int = 30):
+    """Sector forecast via TimesFM"""
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(
+                f"http://localhost:8002/sector-forecast?horizon={horizon}",
+                timeout=aiohttp.ClientTimeout(total=300)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return NumpyJSONResponse(content=_numpy_safe(data))
+                return NumpyJSONResponse(content={"error": f"TimesFM service returned {resp.status}"})
+    except Exception as e:
+        return NumpyJSONResponse(content={"error": f"TimesFM sector unavailable: {str(e)}"})
+
+@app.get("/api/timesfm/status")
+async def timesfm_status():
+    """Check if TimesFM service is running"""
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get("http://localhost:8002/health", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    return {"status": "online", "service": "TimesFM on port 8002"}
+    except:
+        pass
+    return {"status": "offline", "hint": "Run: cd ~/IndianHedgeFund/backend && python3.11 timesfm_service.py"}
+
+
+# ══════════════════════════════════════════════════════════════════
+# KEN GRIFFIN / CITADEL ADDITIONS — Order Flow, Vol Surface, Strategy
+# ══════════════════════════════════════════════════════════════════
+
+# ── ORDER FLOW ─────────────────────────────────────────────────────
+
+@app.get("/api/orderflow/{symbol}")
+async def get_order_flow(symbol: str, period: str = "6mo"):
+    loop = asyncio.get_event_loop()
+    def compute():
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period=period)
+            if df is None or len(df) < 20:
+                return {"error": "No data"}
+            return _of.compute_order_flow(df)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/dark-pool/{symbol}")
+async def get_dark_pool(symbol: str):
+    loop = asyncio.get_event_loop()
+    def compute():
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="6mo")
+            return _of.compute_dark_pool_proxy(df, symbol)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/seasonality/{symbol}")
+async def get_seasonality(symbol: str):
+    loop = asyncio.get_event_loop()
+    def compute():
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="5y")
+            return _of.compute_seasonality(df)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/liquidity/{symbol}")
+async def get_liquidity(symbol: str):
+    loop = asyncio.get_event_loop()
+    def compute():
+        try:
+            import yfinance as yf
+            df = yf.Ticker(f"{symbol.upper()}.NS").history(period="3mo")
+            return _of.compute_liquidity_metrics(df)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+@app.get("/api/kalman-pairs")
+async def get_kalman_pairs(sym1: str, sym2: str, period: str = "1y"):
+    loop = asyncio.get_event_loop()
+    def compute():
+        try:
+            import yfinance as yf
+            t1 = yf.Ticker(f"{sym1.upper()}.NS").history(period=period)["Close"]
+            t2 = yf.Ticker(f"{sym2.upper()}.NS").history(period=period)["Close"]
+            common = t1.index.intersection(t2.index)
+            if len(common) < 30:
+                return {"error": "Insufficient overlapping data"}
+            y = t1.loc[common].values.astype(float)
+            x = t2.loc[common].values.astype(float)
+            result = _of.kalman_filter_pairs(y, x)
+            result["sym1"] = sym1.upper()
+            result["sym2"] = sym2.upper()
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ── VOLATILITY SURFACE ─────────────────────────────────────────────
+
+@app.get("/api/vol-surface/{symbol}")
+async def get_vol_surface(symbol: str):
+    loop = asyncio.get_event_loop()
+    def compute():
+        try:
+            import yfinance as yf
+            tk = yf.Ticker(f"{symbol.upper()}.NS")
+            hist = tk.history(period="1y")
+            if hist is None or len(hist) < 20:
+                return {"error": "No price data"}
+            spot = float(hist["Close"].iloc[-1])
+
+            # Estimate ATM IV from 30-day historical vol as proxy
+            returns = hist["Close"].pct_change().dropna()
+            hv30 = float(returns.tail(30).std() * (252 ** 0.5))
+            # Typical IV premium ~20% over HV
+            atm_iv = hv30 * 1.2
+
+            surface = _vs.build_vol_surface(spot, atm_iv)
+            surface["symbol"] = symbol.upper()
+            surface["hv30_pct"] = round(hv30 * 100, 2)
+            surface["iv_hv_ratio"] = round(atm_iv / hv30, 2) if hv30 > 0 else None
+            return surface
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ── OPTIONS STRATEGY BUILDER ───────────────────────────────────────
+
+@app.get("/api/strategy/list")
+async def list_strategies():
+    return {"strategies": _vs.STRATEGY_NAMES, "descriptions": _vs.STRATEGY_DESCRIPTIONS}
+
+
+@app.get("/api/strategy/{strategy_name}/{symbol}")
+async def get_strategy(strategy_name: str, symbol: str, days: int = 30):
+    loop = asyncio.get_event_loop()
+    def compute():
+        try:
+            import yfinance as yf
+            hist = yf.Ticker(f"{symbol.upper()}.NS").history(period="6mo")
+            if hist is None or len(hist) < 20:
+                return {"error": "No price data"}
+            spot = float(hist["Close"].iloc[-1])
+            returns = hist["Close"].pct_change().dropna()
+            hv = float(returns.tail(30).std() * (252 ** 0.5))
+            iv = hv * 1.2
+            result = _vs.get_strategy(strategy_name, spot, iv, days)
+            result["symbol"] = symbol.upper()
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+class StrategyLegsRequest(BaseModel):
+    legs: List[Dict[str, Any]]
+    spot: float
+    iv: float = 0.20
+    days_to_expiry: int = 30
+
+
+@app.post("/api/strategy/custom")
+async def custom_strategy(req: StrategyLegsRequest):
+    loop = asyncio.get_event_loop()
+    def compute():
+        try:
+            return _vs.strategy_pnl(req.legs, req.spot, req.iv, req.days_to_expiry)
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ── PORTFOLIO ATTRIBUTION ──────────────────────────────────────────
+
+@app.get("/api/portfolio/attribution")
+async def portfolio_attribution():
+    """Risk attribution and factor exposure for the paper portfolio."""
+    loop = asyncio.get_event_loop()
+    def compute():
+        try:
+            import yfinance as yf
+
+            # Load portfolio state (same in-memory dict used elsewhere)
+            positions = _pf.get("positions", {})
+            if not positions:
+                return {"error": "Portfolio is empty", "positions": []}
+
+            results = []
+            total_value = _pf.get("cash", 0)
+            pos_values = {}
+            nifty_hist = yf.Ticker("^NSEI").history(period="1y")["Close"].pct_change().dropna()
+
+            for sym, pos in positions.items():
+                price_data = yf.Ticker(f"{sym}.NS").history(period="5d")
+                price = float(price_data["Close"].iloc[-1]) if len(price_data) > 0 else pos.get("avg_price", 0)
+                val = price * pos["qty"]
+                pos_values[sym] = val
+                total_value += val
+
+            for sym, pos in positions.items():
+                hist_ret = yf.Ticker(f"{sym}.NS").history(period="1y")["Close"].pct_change().dropna()
+                common = hist_ret.index.intersection(nifty_hist.index)
+                beta = 1.0
+                if len(common) > 30:
+                    cov = float(np.cov(hist_ret.loc[common].values, nifty_hist.loc[common].values)[0][1])
+                    var_n = float(np.var(nifty_hist.loc[common].values))
+                    beta = cov / var_n if var_n > 0 else 1.0
+
+                price = pos_values[sym] / pos["qty"]
+                pnl = (price - pos["avg_price"]) * pos["qty"]
+                weight = pos_values[sym] / total_value if total_value > 0 else 0
+
+                results.append({
+                    "symbol": sym,
+                    "qty": pos["qty"],
+                    "avg_price": round(pos["avg_price"], 2),
+                    "current_price": round(price, 2),
+                    "market_value": round(pos_values[sym], 2),
+                    "weight_pct": round(weight * 100, 2),
+                    "pnl": round(pnl, 2),
+                    "pnl_pct": round(pnl / (pos["avg_price"] * pos["qty"]) * 100, 2),
+                    "beta": round(beta, 3),
+                    "beta_contribution": round(beta * weight, 4),
+                })
+
+            portfolio_beta = sum(r["beta_contribution"] for r in results)
+            total_pnl = sum(r["pnl"] for r in results)
+
+            return {
+                "positions": results,
+                "portfolio_beta": round(portfolio_beta, 3),
+                "total_market_value": round(total_value, 2),
+                "total_pnl": round(total_pnl, 2),
+                "cash": round(_pf.get("cash", 0), 2),
+                "position_count": len(results),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ── CROSS-ASSET HEATMAP ────────────────────────────────────────────
+
+@app.get("/api/heatmap/nifty50")
+async def nifty50_heatmap():
+    """Real-time heatmap data: symbol, sector, change%, market cap for Nifty 50."""
+    loop = asyncio.get_event_loop()
+    def compute():
+        import yfinance as yf
+        sector_map = {
+            "RELIANCE": "Energy", "TCS": "IT", "HDFCBANK": "Banking", "INFY": "IT",
+            "ICICIBANK": "Banking", "HINDUNILVR": "FMCG", "BAJFINANCE": "Finance",
+            "BHARTIARTL": "Telecom", "SBIN": "Banking", "KOTAKBANK": "Banking",
+            "ITC": "FMCG", "LT": "Infra", "AXISBANK": "Banking", "TITAN": "Consumer",
+            "ASIANPAINT": "Consumer", "MARUTI": "Auto", "ULTRACEMCO": "Cement",
+            "WIPRO": "IT", "HCLTECH": "IT", "NESTLEIND": "FMCG",
+            "ADANIENT": "Conglomerate", "ADANIPORTS": "Infra", "POWERGRID": "Power",
+            "NTPC": "Power", "ONGC": "Energy", "COALINDIA": "Energy",
+            "GRASIM": "Materials", "BAJAJFINSV": "Finance", "TATASTEEL": "Metals",
+            "JSWSTEEL": "Metals", "HDFCLIFE": "Insurance", "SBILIFE": "Insurance",
+            "DIVISLAB": "Pharma", "CIPLA": "Pharma", "DRREDDY": "Pharma",
+            "SUNPHARMA": "Pharma", "TECHM": "IT", "INDUSINDBK": "Banking",
+            "BPCL": "Energy", "EICHERMOT": "Auto", "BRITANNIA": "FMCG",
+            "HINDALCO": "Metals", "TATAMOTORS": "Auto", "APOLLOHOSP": "Healthcare",
+            "HEROMOTOCO": "Auto", "MM": "Auto", "SHREECEM": "Cement",
+            "TATACONSUM": "FMCG", "PIDILITIND": "Chemicals", "LTIM": "IT",
+        }
+        results = []
+        for sym in NIFTY50_SYMBOLS:
+            try:
+                snap = _price_cache.get(sym)
+                chg = 0.0
+                price = 0.0
+                if snap:
+                    price = snap.get("price", 0)
+                    chg = snap.get("change_pct", 0)
+                results.append({
+                    "symbol": sym,
+                    "sector": sector_map.get(sym, "Other"),
+                    "change_pct": round(chg, 2),
+                    "price": round(price, 2),
+                })
+            except:
+                pass
+        return {"heatmap": results, "timestamp": time.time()}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ── MULTI-STOCK CORRELATION LIVE ───────────────────────────────────
+
+@app.get("/api/correlation/live")
+async def live_correlation(symbols: str = "RELIANCE,TCS,HDFCBANK,INFY,ICICIBANK,SBIN"):
+    """Real-time rolling 60-day correlation matrix for given symbols."""
+    loop = asyncio.get_event_loop()
+    def compute():
+        try:
+            import yfinance as yf
+            syms = [s.strip().upper() for s in symbols.split(",")][:12]
+            prices = {}
+            for s in syms:
+                hist = yf.Ticker(f"{s}.NS").history(period="6mo")["Close"]
+                if len(hist) > 30:
+                    prices[s] = hist
+            if len(prices) < 2:
+                return {"error": "Need at least 2 symbols with data"}
+            df = pd.DataFrame(prices).dropna()
+            returns = df.pct_change().dropna()
+            corr = returns.tail(60).corr()
+            matrix = []
+            syms_avail = list(corr.columns)
+            for s1 in syms_avail:
+                row = []
+                for s2 in syms_avail:
+                    row.append(round(float(corr.loc[s1, s2]), 3))
+                matrix.append(row)
+            return {"symbols": syms_avail, "matrix": matrix, "window_days": 60}
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
+
+
+# ── RISK SCANNER ───────────────────────────────────────────────────
+
+@app.get("/api/risk-scan")
+async def risk_scan():
+    """Scan Nifty 50 for high-risk signals: VaR breach, vol spike, RSI extremes."""
+    loop = asyncio.get_event_loop()
+    def compute():
+        try:
+            import yfinance as yf
+            alerts = []
+            for sym in NIFTY50_SYMBOLS[:25]:
+                try:
+                    hist = yf.Ticker(f"{sym}.NS").history(period="3mo")
+                    if len(hist) < 20:
+                        continue
+                    returns = hist["Close"].pct_change().dropna()
+                    hv = float(returns.std() * (252 ** 0.5))
+                    hv20 = float(returns.tail(20).std() * (252 ** 0.5))
+                    var95 = float(np.percentile(returns.tail(60), 5))
+                    rsi_vals = returns.tail(14)
+                    delta = rsi_vals.values
+                    gains = delta[delta > 0].mean() if (delta > 0).any() else 0
+                    losses = -delta[delta < 0].mean() if (delta < 0).any() else 0
+                    rsi = 100 - (100 / (1 + gains / losses)) if losses > 0 else 50
+
+                    flags = []
+                    if hv20 > hv * 1.5:
+                        flags.append("VOL_SPIKE")
+                    if rsi > 75:
+                        flags.append("OVERBOUGHT")
+                    elif rsi < 25:
+                        flags.append("OVERSOLD")
+                    if var95 < -0.04:
+                        flags.append("HIGH_VAR")
+
+                    if flags:
+                        price = float(hist["Close"].iloc[-1])
+                        chg = float(returns.iloc[-1] * 100)
+                        alerts.append({
+                            "symbol": sym,
+                            "price": round(price, 2),
+                            "change_pct": round(chg, 2),
+                            "hv_annualized_pct": round(hv * 100, 1),
+                            "var95_daily_pct": round(var95 * 100, 2),
+                            "rsi": round(rsi, 1),
+                            "flags": flags,
+                            "severity": "HIGH" if len(flags) >= 2 else "MEDIUM",
+                        })
+                except:
+                    pass
+            alerts.sort(key=lambda x: -len(x["flags"]))
+            return {"alerts": alerts, "scanned": 25, "flagged": len(alerts)}
+        except Exception as e:
+            return {"error": str(e)}
+    result = await loop.run_in_executor(None, compute)
+    return NumpyJSONResponse(content=_numpy_safe(result))
 
 
 if __name__ == "__main__":

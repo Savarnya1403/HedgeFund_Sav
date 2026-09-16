@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 
 const PAGES = [
+  { label: "Home Dashboard",     path: "/home",          icon: "⌂", desc: "Comprehensive market outlook — sectors, sentiment, FII, news" },
   { label: "Dashboard",          path: "/dashboard",     icon: "◈", desc: "Market intelligence hub" },
   { label: "Screener",           path: "/screener",      icon: "⚡", desc: "Momentum, breakout, mean reversion" },
   { label: "Global Macro",       path: "/macro",         icon: "◎", desc: "Indices, FX, commodities, yield curve, macro regime" },

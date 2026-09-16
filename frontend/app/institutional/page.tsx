@@ -169,7 +169,7 @@ function FlowBarChart({ daily }: { daily: FiiDiiDay[] }) {
           const diiColor = d.dii_net >= 0 ? "#3b82f6" : "#f59e0b";
 
           return (
-            <g key={d.date}>
+            <g key={`${d.date}-${i}`}>
               <rect x={x} y={fiiY} width={barW} height={Math.max(1, fiiH)}
                 fill={fiiColor} opacity={0.85} rx={1} />
               <rect x={x + barW + gap} y={diiY} width={barW} height={Math.max(1, diiH)}

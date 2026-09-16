@@ -796,10 +796,12 @@ export default function RecommendPage() {
                 borderRadius: 8,
                 overflow: "hidden",
               }}>
+                <div style={{ overflowX: "auto" }}>
                 <table style={{
                   width: "100%",
                   borderCollapse: "collapse",
                   tableLayout: "fixed",
+                  minWidth: 680,
                 }}>
                   <colgroup>
                     <col style={{ width: 36 }} />
@@ -846,6 +848,7 @@ export default function RecommendPage() {
                     )}
                   </tbody>
                 </table>
+                </div>
               </div>
 
               {/* Detail Panel */}

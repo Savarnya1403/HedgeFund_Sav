@@ -135,10 +135,12 @@ export default function ScreenerPage() {
   const [tab, setTab] = useState<Tab>("momentum");
   const [results, setResults] = useState<Record<string, unknown>[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [lastUpdate, setLastUpdate] = useState<string>("");
 
   const load = useCallback(async (t: Tab) => {
     setLoading(true);
+    setError(null);
     try {
       let res: { results: Record<string, unknown>[] };
       if (t === "momentum") res = await api.screenerMomentum();
@@ -147,7 +149,8 @@ export default function ScreenerPage() {
       else res = await api.screenerVolume();
       setResults(res.results || []);
       setLastUpdate(new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }));
-    } catch {
+    } catch (e) {
+      setError((e as Error).message || "Failed to load");
       setResults([]);
     } finally {
       setLoading(false);
@@ -157,10 +160,10 @@ export default function ScreenerPage() {
   useEffect(() => { load(tab); }, [tab, load]);
 
   const TABS: { key: Tab; label: string; desc: string }[] = [
-    { key: "momentum", label: "Momentum", desc: "IBD RS Rank — 65d/125d/252d weighted return" },
-    { key: "meanrev", label: "Mean Reversion", desc: "Oversold/overbought by Z-score, RSI, Bollinger" },
-    { key: "breakout", label: "Breakout Scanner", desc: "Near 52W highs with volume confirmation" },
-    { key: "volume", label: "Volume Surge", desc: "Today's volume >2x 20-day average" },
+    { key: "momentum", label: "Momentum", desc: "IBD RS Rank — 65d/125d/252d weighted return across Nifty 100 + PSU" },
+    { key: "meanrev", label: "Mean Reversion", desc: "Stocks ranked by Z-score deviation + RSI + Bollinger Band extremes" },
+    { key: "breakout", label: "Breakout Scanner", desc: "52W high breakouts & resistance breaks with volume confirmation" },
+    { key: "volume", label: "Volume Surge", desc: "Stocks trading at 1.5x+ their 20-day average volume today" },
   ];
 
   const activeDesc = TABS.find(t => t.key === tab)?.desc ?? "";
@@ -209,14 +212,28 @@ export default function ScreenerPage() {
                 <div key={i} className="skeleton" style={{ height: 48, marginBottom: 4, borderRadius: 6 }} />
               ))}
               <p style={{ color: "#555", fontSize: 11, textAlign: "center", marginTop: 12 }}>
-                Computing signals across Nifty 100 + PSU universe…
+                Scanning {tab === "momentum" ? "252d" : tab === "meanrev" ? "6mo" : "1y"} history across 120+ symbols…
+                <br />
+                <span style={{ color: "#333" }}>First run may take up to 60s while data is fetched</span>
               </p>
             </div>
+          ) : error ? (
+            <div style={{ padding: 48, textAlign: "center" }}>
+              <div style={{ color: "#ef4444", fontSize: 12, marginBottom: 8 }}>Failed to load screener</div>
+              <div style={{ color: "#555", fontSize: 11, marginBottom: 16 }}>{error}</div>
+              <button onClick={() => load(tab)} style={{
+                background: "#1a1a1a", border: "1px solid #2e2e2e", color: "#e5e5e5",
+                borderRadius: 6, padding: "6px 16px", fontSize: 11, cursor: "pointer",
+              }}>Retry</button>
+            </div>
           ) : results.length === 0 ? (
-            <div style={{ padding: 48, textAlign: "center", color: "#555" }}>No signals found</div>
+            <div style={{ padding: 48, textAlign: "center", color: "#555" }}>
+              No signals found for current market conditions
+            </div>
           ) : (
             <div style={{ background: "#111", border: "1px solid #1e1e1e", borderRadius: 8, overflow: "hidden" }}>
-              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 520 }}>
                 <thead>
                   <tr style={{ borderBottom: "1px solid #1e1e1e" }}>
                     {tab === "momentum" && <th style={th}>#</th>}
@@ -257,6 +274,7 @@ export default function ScreenerPage() {
                   ))}
                 </tbody>
               </table>
+              </div>
             </div>
           )}
         </div>

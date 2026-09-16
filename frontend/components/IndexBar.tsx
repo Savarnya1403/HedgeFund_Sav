@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { api, fmt, changeClass, changeSign, type IndexData, type MacroTicker } from "@/lib/api";
 import { usePriceContext } from "@/contexts/PriceContext";
@@ -15,20 +15,34 @@ const MACRO_FORMATS: Record<string, (v: number) => string> = {
 };
 
 const NAV_ITEMS = [
-  { label: "TERMINAL",  path: "/" },
-  { label: "DASH",      path: "/dashboard" },
-  { label: "SCREENER",  path: "/screener" },
-  { label: "MACRO",     path: "/macro" },
-  { label: "INSTIT",    path: "/institutional" },
-  { label: "QUANT",     path: "/quant" },
-  { label: "SIGNALS",   path: "/recommend" },
-  { label: "COMPARE",   path: "/compare" },
-  { label: "GLOBE",     path: "/globe" },
-  { label: "VOLUME",    path: "/volume" },
-  { label: "PATTERNS",  path: "/patterns" },
-  { label: "PAIRS",     path: "/pairs" },
-  { label: "SECTORS",   path: "/sectors" },
-  { label: "NEWS",      path: "/news" },
+  { label: "TERMINAL",   path: "/" },
+  { label: "HOME",       path: "/home" },
+  { label: "DASH",       path: "/dashboard" },
+  { label: "SCREENER",   path: "/screener" },
+  { label: "ADV SCR",    path: "/screener/advanced" },
+  { label: "OPTIONS",    path: "/options" },
+  { label: "STRATEGY",   path: "/strategy" },
+  { label: "VOL SURF",   path: "/vol-surface" },
+  { label: "ORDER FLOW", path: "/orderflow" },
+  { label: "BACKTEST",   path: "/backtest" },
+  { label: "OPTIMIZE",   path: "/optimizer" },
+  { label: "RISK",       path: "/risk" },
+  { label: "RISK SCAN",  path: "/risk-scan" },
+  { label: "DEEP FA",    path: "/fundamental" },
+  { label: "ALT DATA",   path: "/alternative" },
+  { label: "TIMESFM",    path: "/timesfm" },
+  { label: "CALENDAR",   path: "/calendar" },
+  { label: "MACRO",      path: "/macro" },
+  { label: "INSTIT",     path: "/institutional" },
+  { label: "QUANT",      path: "/quant" },
+  { label: "SIGNALS",    path: "/recommend" },
+  { label: "COMPARE",    path: "/compare" },
+  { label: "GLOBE",      path: "/globe" },
+  { label: "VOLUME",     path: "/volume" },
+  { label: "PATTERNS",   path: "/patterns" },
+  { label: "PAIRS",      path: "/pairs" },
+  { label: "SECTORS",    path: "/sectors" },
+  { label: "NEWS",       path: "/news" },
 ];
 
 export default function IndexBar() {
@@ -39,6 +53,13 @@ export default function IndexBar() {
   const [isOpen, setIsOpen] = useState(false);
   const [time, setTime] = useState("");
   const [activePath, setActivePath] = useState("/");
+  const navRef = useRef<HTMLDivElement>(null);
+
+  const scrollNav = (dir: "left" | "right") => {
+    if (navRef.current) {
+      navRef.current.scrollBy({ left: dir === "right" ? 160 : -160, behavior: "smooth" });
+    }
+  };
 
   useEffect(() => {
     setActivePath(window.location.pathname);
@@ -96,23 +117,56 @@ export default function IndexBar() {
         <span style={{ fontSize: 10, color: "#2a2a2a" }}>Search</span>
       </button>
 
-      {/* Nav */}
-      <div style={{ display: "flex", height: "100%", flexShrink: 0, borderRight: "1px solid #141414" }}>
-        {NAV_ITEMS.map(n => {
-          const active = activePath === n.path;
-          return (
-            <button key={n.path} onClick={() => { setActivePath(n.path); router.push(n.path); }}
-              style={{
-                padding: "0 10px", height: "100%", background: "none", border: "none", cursor: "pointer",
-                fontSize: 9, fontWeight: 700, letterSpacing: "0.08em",
-                color: active ? "#e5e5e5" : "#333",
-                borderBottom: active ? "2px solid #3b82f6" : "2px solid transparent",
-              }}
-              onMouseEnter={e => { if (!active) e.currentTarget.style.color = "#666"; }}
-              onMouseLeave={e => { if (!active) e.currentTarget.style.color = "#333"; }}
-            >{n.label}</button>
-          );
-        })}
+      {/* Nav — horizontally scrollable */}
+      <div style={{ display: "flex", alignItems: "center", flexShrink: 0, maxWidth: "55vw", borderRight: "1px solid #141414", height: "100%" }}>
+        {/* Left arrow */}
+        <button
+          onClick={() => scrollNav("left")}
+          style={{ padding: "0 5px", height: "100%", background: "none", border: "none", cursor: "pointer", color: "#333", fontSize: 10, flexShrink: 0 }}
+          onMouseEnter={e => (e.currentTarget.style.color = "#888")}
+          onMouseLeave={e => (e.currentTarget.style.color = "#333")}
+          title="Scroll left"
+        >◂</button>
+
+        {/* Scrollable nav track */}
+        <style>{`
+          .ih-nav-scroll::-webkit-scrollbar { display: none; }
+        `}</style>
+        <div
+          ref={navRef}
+          className="ih-nav-scroll"
+          style={{
+            display: "flex", height: "100%", overflowX: "auto", overflowY: "hidden",
+            scrollbarWidth: "none",
+          }}
+        >
+          <div style={{ display: "flex", height: "100%" }}>
+            {NAV_ITEMS.map(n => {
+              const active = activePath === n.path;
+              return (
+                <button key={n.path} onClick={() => { setActivePath(n.path); router.push(n.path); }}
+                  style={{
+                    padding: "0 9px", height: "100%", background: "none", border: "none", cursor: "pointer",
+                    fontSize: 9, fontWeight: 700, letterSpacing: "0.07em", whiteSpace: "nowrap", flexShrink: 0,
+                    color: active ? "#e5e5e5" : "#333",
+                    borderBottom: active ? "2px solid #3b82f6" : "2px solid transparent",
+                  }}
+                  onMouseEnter={e => { if (!active) e.currentTarget.style.color = "#777"; }}
+                  onMouseLeave={e => { if (!active) e.currentTarget.style.color = "#333"; }}
+                >{n.label}</button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Right arrow */}
+        <button
+          onClick={() => scrollNav("right")}
+          style={{ padding: "0 5px", height: "100%", background: "none", border: "none", cursor: "pointer", color: "#333", fontSize: 10, flexShrink: 0 }}
+          onMouseEnter={e => (e.currentTarget.style.color = "#888")}
+          onMouseLeave={e => (e.currentTarget.style.color = "#333")}
+          title="Scroll right"
+        >▸</button>
       </div>
 
       {/* Indices ticker — scrollable */}

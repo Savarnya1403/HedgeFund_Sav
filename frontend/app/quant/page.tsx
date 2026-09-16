@@ -251,19 +251,20 @@ function ZScoreBar({ zscore, strong }: { zscore: number; strong: boolean }) {
 
 // ─── Factor Bar ───────────────────────────────────────────────────────────────
 
-function FactorBar({ label, score, interpretation }: { label: string; score: number; interpretation: string }) {
-  const color = score > 60 ? "#22c55e" : score >= 40 ? "#f59e0b" : "#ef4444";
+function FactorBar({ label, score, interpretation }: { label: string; score: number | null; interpretation: string }) {
+  const s = score ?? 0;
+  const color = s > 60 ? "#22c55e" : s >= 40 ? "#f59e0b" : "#ef4444";
   return (
     <div style={{ marginBottom: 12 }}>
       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
         <span style={{ fontSize: 10, color: "#888", fontFamily: "monospace", letterSpacing: "0.06em", textTransform: "uppercase" as const }}>
           {label}
         </span>
-        <span style={{ fontSize: 12, fontWeight: 700, color, fontFamily: "monospace" }}>{score.toFixed(0)}</span>
+        <span style={{ fontSize: 12, fontWeight: 700, color, fontFamily: "monospace" }}>{s.toFixed(0)}</span>
       </div>
       <div style={{ height: 6, background: "#1a1a1a", borderRadius: 3, overflow: "hidden" }}>
         <div style={{
-          height: "100%", width: `${score}%`, background: color,
+          height: "100%", width: `${s}%`, background: color,
           borderRadius: 3, transition: "width 0.5s ease",
         }} />
       </div>

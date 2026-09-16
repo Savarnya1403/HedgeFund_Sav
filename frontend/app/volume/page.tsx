@@ -34,7 +34,8 @@ function fmtVol(v: number): string {
   return String(v);
 }
 
-function fmtDev(v: number): string {
+function fmtDev(v: number | null): string {
+  if (v == null) return "N/A";
   return (v >= 0 ? "+" : "") + v.toFixed(1) + "%";
 }
 

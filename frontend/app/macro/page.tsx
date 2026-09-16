@@ -717,7 +717,7 @@ export default function MacroPage() {
         <div style={{ display: "grid", gridTemplateColumns: "280px 1fr", height: "100%" }}>
 
           {/* LEFT COLUMN */}
-          <div style={{ borderRight: "1px solid #141414", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+          <div style={{ borderRight: "1px solid #141414", display: "flex", flexDirection: "column", overflowY: "auto" }}>
             {/* Macro Regime */}
             <div style={{ borderBottom: "1px solid #141414", flexShrink: 0 }}>
               <SectionHeader title="MACRO REGIME" sub="Risk assessment" />
@@ -732,7 +732,7 @@ export default function MacroPage() {
           </div>
 
           {/* RIGHT COLUMN */}
-          <div style={{ display: "flex", flexDirection: "column", overflow: "hidden" }}>
+          <div style={{ display: "flex", flexDirection: "column", overflowY: "auto" }}>
 
             {/* TOP ROW: Indices + Forex */}
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", borderBottom: "1px solid #141414", flexShrink: 0 }}>
@@ -796,7 +796,7 @@ export default function MacroPage() {
             </div>
 
             {/* BOTTOM ROW: India Macro Sensitivity (full width) */}
-            <div style={{ flex: 1, overflow: "hidden" }}>
+            <div style={{ flex: 1, overflow: "auto" }}>
               <SectionHeader title="INDIA MACRO SENSITIVITY" sub="INR & Crude impact by stock" />
               <IndiaSensitivityTable data={sensitivity} loading={loadingSensitivity} />
             </div>

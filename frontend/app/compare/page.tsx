@@ -492,6 +492,7 @@ export default function ComparePage() {
             flexShrink: 0,
             borderTop: "1px solid #141414",
             background: "#030303",
+            overflowX: "auto",
           }}
         >
           <table

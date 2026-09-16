@@ -275,11 +275,24 @@ export interface SectorData {
   stocks: { symbol: string; price: number; change_pct: number }[];
 }
 
-async function get<T>(path: string, retries = 2): Promise<T> {
+export interface SectorSpotlight {
+  sector: string;
+  shine_score: number;
+  mom_1d: number;
+  mom_5d: number;
+  breadth_pct: number;
+  vol_surge: number;
+  advances: number;
+  total: number;
+  label: string;
+  color: string;
+}
+
+async function get<T>(path: string, retries = 2, timeoutMs = 12000): Promise<T> {
   let lastErr: Error = new Error("fetch failed");
   for (let i = 0; i <= retries; i++) {
     const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(new DOMException("Timeout", "AbortError")), 12000);
+    const tid = setTimeout(() => controller.abort(new DOMException("Timeout", "AbortError")), timeoutMs);
     try {
       const res = await fetch(`${BASE}${path}`, {
         cache: "no-store",
@@ -346,13 +359,13 @@ export const api = {
   pairDetail: (sym1: string, sym2: string) =>
     get<PairData>(`/api/pairs/${sym1}/${sym2}`),
   screenerMomentum: () =>
-    get<{ type: string; results: Record<string, unknown>[] }>("/api/screener/momentum"),
+    get<{ type: string; results: Record<string, unknown>[] }>("/api/screener/momentum", 1, 90000),
   screenerMeanRev: () =>
-    get<{ type: string; results: Record<string, unknown>[] }>("/api/screener/meanrev"),
+    get<{ type: string; results: Record<string, unknown>[] }>("/api/screener/meanrev", 1, 90000),
   screenerBreakout: () =>
-    get<{ type: string; results: Record<string, unknown>[] }>("/api/screener/breakout"),
+    get<{ type: string; results: Record<string, unknown>[] }>("/api/screener/breakout", 1, 90000),
   screenerVolume: () =>
-    get<{ type: string; results: Record<string, unknown>[] }>("/api/screener/volume"),
+    get<{ type: string; results: Record<string, unknown>[] }>("/api/screener/volume", 1, 90000),
   optionsAnalytics: (symbol: string) => get<unknown>(`/api/options/analytics/${symbol}`),
   breadth: () => get<BreadthData>("/api/breadth"),
   sectors: () => get<{ sectors: SectorData[] }>("/api/sectors"),
@@ -412,6 +425,7 @@ export const api = {
     get<unknown>(`/api/greeks?symbol=${symbol}&strike=${strike}&expiry_days=${expiry_days}&opt_type=${opt_type}&iv=${iv}`),
   fearGreed: () => get<{ score: number; label: string; color: string; components: unknown }>("/api/fear-greed"),
   snapshot: (symbols: string) => get<{ data: Record<string, unknown>; ts: number; count: number }>(`/api/snapshot?symbols=${encodeURIComponent(symbols)}`),
+  sectorSpotlight: () => get<{ sectors: SectorSpotlight[]; ts: number }>("/api/sector/spotlight"),
 };
 
 export function fmt(n: number | undefined | null, dec = 2): string {
