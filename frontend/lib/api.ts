@@ -1,4 +1,4 @@
-const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001";
+const BASE = typeof window === "undefined" ? (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001") : "/api/backend";
 
 export interface IndexData {
   name: string;
